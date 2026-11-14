@@ -10,8 +10,8 @@
     "start": "node scripts/serve.cjs",
     "test": "node scripts/test.cjs",
     "test:gpu": "node test-gpu-runner.cjs --navigation --hardware",
-    "format": "prettier --write poc-anchors.html poc-anchors.css comparison-view.js observation-tools.js src scripts docs README.md package.json .github",
-    "format:check": "prettier --check poc-anchors.html poc-anchors.css comparison-view.js observation-tools.js src scripts docs README.md package.json .github",
+    "format": "prettier --write test-anchor-poc.cjs test-anchors-gpu.html test-anchors-ui.html poc-anchors.html poc-anchors.css comparison-view.js observation-tools.js src scripts docs README.md package.json .github",
+    "format:check": "prettier --check test-anchor-poc.cjs test-anchors-gpu.html test-anchors-ui.html poc-anchors.html poc-anchors.css comparison-view.js observation-tools.js src scripts docs README.md package.json .github",
     "test:anchors": "node test-gpu-runner.cjs --anchors --hardware",
     "test:anchors-ui": "node test-gpu-runner.cjs --anchors-ui --hardware"
   },
