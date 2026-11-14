@@ -38,6 +38,16 @@ La recherche intersecte des sous-arbres de rangs avec la fenêtre. Le budget de 
 
 Les coordonnées de naissance ont un cache FIFO borné. Les recherches peuvent être réutilisées pendant au plus dix années simulées et tant que déplacement estimé de la matière plus déplacement de caméra restent sous 0,25 pixel CSS. Les positions et vitesses des identités sont toujours réévaluées ; les objets hors champ sont écartés. Ce cache ne conserve pas une image déplacée ni un ensemble de points figés.
 
+## Visibilité stellaire et temps
+
+La luminosité reçue d'une étoile ne dépend plus du nombre total de sources estimées dans le cadre. Le POC emploie une intensité individuelle non modulée par le niveau de détail : luminosité de naissance et distance à la caméra déterminent le flux. La densité intervient dans la présélection bornée et dans le fond non résolu, jamais comme un multiplicateur du flux d'une étoile.
+
+Le champ « Sensibilité d’apparition » règle désormais le seuil du détecteur : seuil de pic = 0,000125 × 160 / sensibilité. Sa valeur par défaut reste 160. Une valeur supérieure permet de détecter des signaux plus faibles sans augmenter leur luminosité. Cette sémantique remplace l'ancien raccord fondé sur le nombre d'étoiles dans la fenêtre.
+
+Les candidates détectables sont classées par flux visible reçu. À zoom constant ou croissant, les sources visibles déjà connues sont conservées dans le budget tant qu'elles restent dans le cadre et au-dessus du seuil. Leurs positions, vitesses et flux sont réévalués. Le dézoom ne donne pas cette priorité. La découverte demeure approximative ; ce mécanisme ne crée pas de nouvelles identités et ne fixe pas les positions.
+
+Régression reproduite à 10 000 ancres : en suivant une identité de référence, l'ancien affichage passait d'environ 460 sources à 5 entre 0 et 5 Myr, alors que la densité locale augmentait. Après correction, le test donne 461 puis 465 sources, avec un signal de l'étoile suivie identique à toutes les époques testées jusqu'à 26,5 Myr. Les autres étoiles peuvent réellement entrer ou sortir du cadre. La recherche incomplète et la validité à long terme du transport restent des limites séparées.
+
 ## Limites à évaluer avant une adoption
 
 Ce POC teste une représentation, sans démontrer qu'elle remplace fidèlement la dynamique du continu.

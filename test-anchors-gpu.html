@@ -6,6 +6,10 @@
 <script src="fmm-gpu-compute.js"></script>
 <script src="src/poc/anchor-engine.js"></script>
 <script src="src/poc/anchor-population.js"></script>
+<script src="src/observation/camera-frame.js"></script>
+<script src="observation-tools.js"></script>
+<script src="stellar-light.js"></script>
+<script src="src/poc/stellar-visibility.js"></script>
 <script>
   (async () => {
     let engine;
@@ -20,7 +24,15 @@
         id = population.universe + "/0/12345",
         birth = population.resolve(id),
         reports = [];
-      for (const target of [0, 5, 15, 26.5]) {
+      let prior = [],
+        trackedPeak = null;
+      const trackedId = population.universe + "/1f3/807064";
+      const context = renderContext(viewportGeometry(1180, 856), {
+        worldShortSpan: 0.004,
+        sigmaCss: 1,
+        lengthPc: 10000,
+      });
+      for (const target of [0, 1, 2, 5, 15, 26.5]) {
         while (engine.time < target - 1e-8)
           await engine.advance(Math.min(0.8, target - engine.time));
         const centre = { x: -0.208141793, y: 0.120666986 },
@@ -52,6 +64,54 @@
           Math.abs(nearLeft / nearRight - 1) > 0.001
         )
           throw Error("Density discontinuity");
+        const trackedStar = population.resolve(trackedId),
+          view = {
+            x: trackedStar.x,
+            y: trackedStar.y,
+            width: context.worldSpan,
+            aspectX: context.aspectX,
+            aspectY: context.aspectY,
+          };
+        const projection = population.windowProjection(view);
+        projection.cameraWidth = context.worldShortSpan;
+        const optics = POCStellarVisibility.options({
+          population: population.population,
+          context,
+          exposureEV: -4.5,
+          onset: 160,
+        });
+        let threshold = minimumLuminosity(projection, optics),
+          filter = StellarPopulation.luminosityFilter(threshold);
+        for (
+          let i = 0;
+          i < 32 && projection.expected * filter.fraction > 8192 * 0.6;
+          i++
+        ) {
+          threshold *= 2;
+          const next = StellarPopulation.luminosityFilter(threshold);
+          if (!next.fraction) break;
+          filter = next;
+        }
+        const discovery = population.sample({
+          ...view,
+          budget: 8192,
+          rankFilter: filter,
+        });
+        const merged = new Map(discovery.points.map((p) => [p.id, p]));
+        for (const p of prior) merged.set(p.id, population.resolve(p.id));
+        merged.set(trackedId, trackedStar);
+        const visible = POCStellarVisibility.select(
+          projection,
+          [...merged.values()],
+          { ...optics, budget: 8192, priorIds: prior.map((p) => p.id) },
+        );
+        const reference = visible.find((p) => p.id === trackedId);
+        if (!reference)
+          throw Error("Tracked star disappeared while density changed");
+        trackedPeak ??= reference.peak;
+        if (Math.abs(reference.peak / trackedPeak - 1) > 1e-12)
+          throw Error("Density altered the tracked source brightness");
+        prior = visible;
         const d = engine.diagnostics();
         reports.push({
           time: engine.time,
@@ -66,6 +126,10 @@
           angularDrift:
             (d.angularMomentum - engine.initialAngular) / engine.initialAngular,
           physicsMs: engine.lastMs,
+          trackedExpected: projection.expected,
+          rawDiscovered: discovery.points.length,
+          visibleSources: visible.length,
+          trackedPeak: reference.peak,
         });
       }
       const p = population.resolve(id);

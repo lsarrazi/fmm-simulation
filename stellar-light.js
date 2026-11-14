@@ -45,10 +45,10 @@ function sourceOptics(point,geometry){const photometry=point.photometry||stellar
 const DEFAULT_STELLAR_FADE=Object.freeze({enabled:true,start:1000000,end:1000,curve:10});
 function readStellarFade(values={}){const result={...DEFAULT_STELLAR_FADE,...values};for(const key of ['start','end','curve']){result[key]=Number(String(result[key]).trim().replace(',','.'));if(!Number.isFinite(result[key])||!(result[key]>0)){const e=Error('Distances et courbe strictement positives attendues.');e.field='fade'+key[0].toUpperCase()+key.slice(1);throw e;}}if(result.start<=result.end){const e=Error('Le début doit être plus éloigné que la fin de l’atténuation.');e.field='fadeStart';throw e;}result.enabled=!!result.enabled;return result;}
 function stellarGlareOpacity(source,fade=DEFAULT_STELLAR_FADE,logRange=Math.log(fade.start/fade.end)){if(!fade.enabled||source.photometry.disc||!(source.photometry.radius>0))return 1;const distance=source.distancePc/(source.photometry.radius*Population.solarRadiusPc);if(distance>=fade.start)return 1;if(distance<=fade.end)return 0;const t=Math.log(distance/fade.end)/logRange;return (t*t*(3-2*t))**fade.curve;}
-function minimumLuminosity(projection,{population,size=600,sigma=1,gain=1,exposureEV=0,fovDegrees=50,context=null}={}){
+function minimumLuminosity(projection,{population,size=600,sigma=1,gain=1,exposureEV=0,fovDegrees=50,context=null,minimumPeak=.000125}={}){
  if(context){size=context.exposurePixels;sigma=context.sigmaPixels;}
  const factor=(Math.tan(fovDegrees*Math.PI/360)/Math.tan(25*Math.PI/180))**2;
- return .000125*2*Math.PI*sigma*sigma*Number(population)*Population.meanVisibleLuminosity*(projection.cameraWidth??projection.width)**2/(gain*size*size*2**exposureEV*factor);
+ return minimumPeak*2*Math.PI*sigma*sigma*Number(population)*Population.meanVisibleLuminosity*(projection.cameraWidth??projection.width)**2/(gain*size*size*2**exposureEV*factor);
 }
 // Local surface LOD is based on projected physical size and sensor signal,
 // never mass labels, zoom alone, or previously-visible source retention.
@@ -56,7 +56,7 @@ function surfaceVisibility(radiusPixels,peak,{pixelRatio=1}={}){
  const smooth=(x,lo,hi)=>{const t=Math.max(0,Math.min(1,Math.log2(Math.max(x,1e-30)/lo)/Math.log2(hi/lo)));return t*t*(3-2*t);};
  const angular=smooth(radiusPixels/pixelRatio,.35,1.25),signal=smooth(peak,.00003125,.0005);return angular*signal;
 }
-function plan(projection,points,{population,size=600,sigma=1,complete=false,gain=1,exposureEV=0,lengthPc=10000,normalizationLengthPc=lengthPc,fovDegrees=50,detailWeight=1,stellarFade=DEFAULT_STELLAR_FADE,context=null}={}){
+function plan(projection,points,{population,size=600,sigma=1,complete=false,gain=1,exposureEV=0,lengthPc=10000,normalizationLengthPc=lengthPc,fovDegrees=50,detailWeight=1,stellarFade=DEFAULT_STELLAR_FADE,context=null,minimumPeak=.000125}={}){
  if(context){size=context.pixelSpan;sigma=context.sigmaPixels;}
  reserveStellarProperties(points.length);
  detailWeight=Math.max(0,Math.min(1,detailWeight));
@@ -65,7 +65,7 @@ function plan(projection,points,{population,size=600,sigma=1,complete=false,gain
  const sources=[],drawn=[],candidates=[];let luminosity=0,leastVisible=Infinity,stellarSourceCount=0;
  for(const p of points){if(Math.abs(p.x-geometry.centerX)>projection.width*(context?.aspectX??projection.aspectX??1)/2||Math.abs(p.y-geometry.centerY)>projection.width*(context?.aspectY??projection.aspectY??1)/2)continue;const ix=Math.floor((p.x-projection.left)/projection.width*projection.resolution),iy=Math.floor((p.y-projection.bottom)/projection.width*projection.resolution);if(ix<0||iy<0||ix>=projection.resolution||iy>=projection.resolution)continue;
   const optics=sourceOptics(p,geometry),linearFlux=optics.visibleFluxWm2*fluxGain*(optics.photometry.isSystemBody?1:detailWeight),peak=linearFlux*exposure/(psfArea+Math.PI*optics.radiusPixels**2*.8),source={...p,photometry:optics.photometry,distancePc:optics.distancePc,fluxWm2:optics.fluxWm2,visibleFluxWm2:optics.visibleFluxWm2,radiusPixels:optics.radiusPixels,insidePhotosphere:optics.insidePhotosphere,linearFlux,peak,photosphereResolved:optics.radiusPixels>=resolvedRadius,glareOpacity:stellarGlareOpacity(optics,stellarFade,fadeLogRange)};source.visibility=p.photometry?.proximityVisibility?surfaceVisibility(optics.radiusPixels,peak,{pixelRatio:context?.pixelRatio??1}):1;candidates.push(source);
-  if(source.visibility>0&&(complete||peak>=.000125||p.photometry?.proximityVisibility)){sources.push(source);if(!source.photometry.isSystemBody){stellarSourceCount++;leastVisible=Math.min(leastVisible,source.photometry.visibleLuminosity);luminosity+=source.photometry.visibleLuminosity;}}
+  if(source.visibility>0&&(complete||peak>=minimumPeak||p.photometry?.proximityVisibility)){sources.push(source);if(!source.photometry.isSystemBody){stellarSourceCount++;leastVisible=Math.min(leastVisible,source.photometry.visibleLuminosity);luminosity+=source.photometry.visibleLuminosity;}}
   if(peak*source.visibility>=.008)drawn.push(source);
  }
  const diffuseImage=new Float64Array(projection.image.length),beam=4*Math.PI*sigma*sigma,pixelArea=(size/projection.resolution)**2,mass=projection.mass??projection.image.reduce((a,b)=>a+b,0),observedMass=projection.viewMass??mass,unrepresented=Math.max(0,1-stellarSourceCount/Math.max(N*observedMass,1e-300));let remaining=0,coverage=0;
@@ -130,9 +130,9 @@ function addResolvedPhotosphere(buffer,size,px,py,flux,rgb,R,sigma,signal=flux*M
 class StellarLightRenderer{
  constructor(size=600){this.resize(size);}
  resize(width,height=width){if(width!==this.width||height!==this.height){this.width=width;this.height=height;this.size=Math.max(width,height);this.linear=new Float32Array(width*height*3);this.linear.height=height;}}
- render(canvas,projection,points,{population,gain=1,exposureEV=0,sigma=1,complete=false,selected=null,lengthPc=10000,normalizationLengthPc=lengthPc,fovDegrees=50,glare=.65,opticalProfile='starburst',spikeAngle=15,detailWeight=1,opticalShape=DEFAULT_OPTICAL_SHAPE,stellarFade=DEFAULT_STELLAR_FADE,context=null}={}){
+ render(canvas,projection,points,{population,gain=1,exposureEV=0,sigma=1,complete=false,selected=null,lengthPc=10000,normalizationLengthPc=lengthPc,fovDegrees=50,glare=.65,opticalProfile='starburst',spikeAngle=15,detailWeight=1,opticalShape=DEFAULT_OPTICAL_SHAPE,stellarFade=DEFAULT_STELLAR_FADE,context=null,minimumPeak=.000125}={}){
   const size=this.size,width=this.width,height=this.height,selectionScale=context?.pixelRatio??1,ctx=canvas.getContext('2d'),buffer=this.linear;if(context)sigma=context.sigmaPixels;buffer.fill(0);if(canvas.width!==width||canvas.height!==height){canvas.width=width;canvas.height=height;}
-  const result=plan(projection,points,{population,size,sigma,complete,gain,exposureEV,lengthPc,normalizationLengthPc,fovDegrees,detailWeight,stellarFade,context}),exposure=2**exposureEV,n=projection.resolution,image=ctx.createImageData(width,height);
+  const result=plan(projection,points,{population,size,sigma,complete,gain,exposureEV,lengthPc,normalizationLengthPc,fovDegrees,detailWeight,stellarFade,context,minimumPeak}),exposure=2**exposureEV,n=projection.resolution,image=ctx.createImageData(width,height);
   const diffuseGain=gain/projection.pixel**2*(normalizationLengthPc/lengthPc)**2*(context?.diffuseScale??1);
   // Bilinear interpolation of the mean photon field, not an opaque density palette.
   if(result.residual>0){const indices=new Int32Array(width),fractions=new Float64Array(width),radii=new Float64Array(width),field=result.diffuseImage,color=Population.meanColor;

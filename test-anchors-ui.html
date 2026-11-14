@@ -75,6 +75,20 @@
         throw Error("Tracked star/image mismatch");
       if (!/M☉/.test($("object").textContent))
         throw Error("Missing physical inspector");
+      const selectedPeak = Number(scene.dataset.selectedPeak);
+      if (!(selectedPeak > 0)) throw Error("Tracked star must be rendered");
+      $("targetTime").value = "31.6";
+      $("advance").click();
+      await wait(
+        () =>
+          Number(scene.dataset.time) >= 31.6 - 1e-6 && !$("advance").disabled,
+      );
+      if (
+        Math.abs(Number(scene.dataset.selectedPeak) / selectedPeak - 1) > 1e-10
+      )
+        throw Error(
+          "Tracked stellar signal changed during five Myr at constant camera distance",
+        );
       const box = scene.getBoundingClientRect();
       if (
         scene.width !== Math.round(box.width * w.devicePixelRatio) ||

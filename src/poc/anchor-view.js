@@ -22,7 +22,8 @@
     searchMs = 0,
     lastSample = null,
     lastLight = null,
-    observationMemo = null;
+    observationMemo = null,
+    previousZoom = 1;
   const meter = new FrameRateMeter(),
     pan = { x: 0, y: 0 };
   let drag = null;
@@ -74,6 +75,8 @@
     engine?.destroy();
     diffuse = renderer = engine = null;
     observationMemo = null;
+    lastLight = null;
+    previousZoom = 1;
     selected = tracked = null;
     points = [];
     camera.x = camera.y = 0;
@@ -132,18 +135,15 @@
         Math.min(65536, Math.floor(Number($("sourceBudget").value) || 0)),
       ),
       onset = Math.max(1, Number($("sourceOnset").value) || 160),
-      detail = $("densityOnly").checked
-        ? 0
-        : stellarDetailLevel(projection.expected, budget, onset);
+      enabled = !$("densityOnly").checked && budget > 0,
+      optics = POCStellarVisibility.options({
+        population: population.population,
+        context,
+        exposureEV: Number($("exposure").value),
+        onset,
+      });
     const started = performance.now();
-    let threshold =
-        minimumLuminosity(projection, {
-          population: population.population,
-          gain: 1,
-          exposureEV: Number($("exposure").value),
-          context,
-          lengthPc: 10000,
-        }) / Math.max(detail, 1e-30),
+    let threshold = minimumLuminosity(projection, optics),
       filter = StellarPopulation.luminosityFilter(threshold);
     for (
       let i = 0;
@@ -160,7 +160,8 @@
     const signature = [
       budget,
       filter.key,
-      detail > 0,
+      enabled,
+      optics.minimumPeak,
       context.worldSpan,
       context.aspectX,
       context.aspectY,
@@ -191,7 +192,7 @@
       };
     } else {
       lastSample =
-        detail > 0 && budget
+        enabled && filter.fraction > 0
           ? population.sample({ ...view, budget, rankFilter: filter })
           : { points: [], visited: 0, approximate: false, shortfall: 0 };
       let speed = 0;
@@ -210,7 +211,20 @@
         ids: lastSample.points.map((p) => p.id),
       };
     }
-    points = lastSample.points;
+    const priorIds =
+      enabled && camera.zoom >= previousZoom
+        ? (lastLight?.sources || []).map((p) => p.id)
+        : [];
+    const candidates = new Map(lastSample.points.map((p) => [p.id, p]));
+    for (const id of priorIds) {
+      const p = population.resolve(id);
+      if (
+        Math.abs(p.x - camera.x) <= context.worldWidth / 2 &&
+        Math.abs(p.y - camera.y) <= context.worldHeight / 2
+      )
+        candidates.set(id, p);
+    }
+    points = [...candidates.values()];
     if (selected && budget > 0 && !$("densityOnly").checked) {
       const p = population.resolve(selected);
       if (
@@ -218,16 +232,22 @@
         Math.abs(p.y - camera.y) < context.worldHeight / 2 &&
         !points.some((q) => q.id === p.id)
       )
-        points = [...points.slice(0, Math.max(0, budget - 1)), p];
+        points = [...points, p];
     }
+    points = enabled
+      ? POCStellarVisibility.select(projection, points, {
+          ...optics,
+          budget,
+          priorIds,
+          selectedId: selected,
+        })
+      : [];
+    previousZoom = camera.zoom;
     searchMs = performance.now() - started;
     renderer.resize(context.pixelWidth, context.pixelHeight);
     lastLight = renderer.render(null, projection, points, {
-      context,
-      population: population.population,
-      gain: 1,
-      exposureEV: Number($("exposure").value),
-      detailWeight: detail,
+      ...optics,
+      detailWeight: enabled ? 1 : 0,
       selected,
       complete: false,
       lengthPc: 10000,
@@ -244,6 +264,9 @@
     canvas._frame = { camera: { ...camera }, context, points: lastLight.drawn };
     canvas.dataset.time = String(engine.time);
     canvas.dataset.sources = String(lastLight.sources.length);
+    canvas.dataset.selectedPeak = String(
+      lastLight.sources.find((p) => p.id === selected)?.peak ?? 0,
+    );
     canvas.dataset.followed = tracked || "";
     canvas.dataset.visited = String(lastSample.visited);
     canvas.dataset.approximate = String(lastSample.approximate);
