@@ -10,12 +10,13 @@
     "start": "node scripts/serve.cjs",
     "test": "node scripts/test.cjs",
     "test:gpu": "node test-gpu-runner.cjs --navigation --hardware",
-    "format": "prettier --write test-anchors-dezoom.html test-poc-stellar-visibility.cjs test-gaussian-diffuse-gpu.html test-anchor-poc.cjs test-anchors-gpu.html test-anchors-ui.html poc-anchors.html poc-anchors.css comparison-view.js observation-tools.js src scripts docs README.md package.json .github",
-    "format:check": "prettier --check test-anchors-dezoom.html test-poc-stellar-visibility.cjs test-gaussian-diffuse-gpu.html test-anchor-poc.cjs test-anchors-gpu.html test-anchors-ui.html poc-anchors.html poc-anchors.css comparison-view.js observation-tools.js src scripts docs README.md package.json .github",
+    "format": "prettier --write test-anchor-discovery.html test-anchors-dezoom.html test-poc-stellar-visibility.cjs test-gaussian-diffuse-gpu.html test-anchor-poc.cjs test-anchors-gpu.html test-anchors-ui.html poc-anchors.html poc-anchors.css comparison-view.js observation-tools.js src scripts docs README.md package.json .github",
+    "format:check": "prettier --check test-anchor-discovery.html test-anchors-dezoom.html test-poc-stellar-visibility.cjs test-gaussian-diffuse-gpu.html test-anchor-poc.cjs test-anchors-gpu.html test-anchors-ui.html poc-anchors.html poc-anchors.css comparison-view.js observation-tools.js src scripts docs README.md package.json .github",
     "test:anchors": "node test-gpu-runner.cjs --anchors --hardware",
     "test:anchors-ui": "node test-gpu-runner.cjs --anchors-ui --hardware",
     "test:diffuse": "node test-gpu-runner.cjs --gaussian-diffuse --hardware",
-    "test:anchors-dezoom": "node test-gpu-runner.cjs --anchors-dezoom --hardware"
+    "test:anchors-dezoom": "node test-gpu-runner.cjs --anchors-dezoom --hardware",
+    "test:anchor-discovery": "node test-gpu-runner.cjs --anchor-discovery --hardware"
   },
   "devDependencies": {
     "prettier": "3.10.1"

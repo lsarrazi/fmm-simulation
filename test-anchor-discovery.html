@@ -1,0 +1,190 @@
+<!doctype html><meta charset="utf-8" />
+<pre id="output">RUNNING</pre>
+<script src="stellar-population.js"></script>
+<script src="src/poc/anchor-population.js"></script>
+<script src="src/poc/anchor-discovery-gpu.js"></script>
+<script>
+  (async () => {
+    let discovery;
+    try {
+      const device = await (
+          await navigator.gpu.requestAdapter()
+        ).requestDevice(),
+        errors = [];
+      device.addEventListener("uncapturederror", (e) =>
+        errors.push(e.error.message),
+      );
+      const engine = {
+        count: 8,
+        seed: 417,
+        time: 0,
+        anchors: Array.from({ length: 8 }, (_, i) => ({
+          x: ((i % 4) - 0.9) * 0.13,
+          y: (Math.floor(i / 4) - 0.4) * 0.23,
+          vx: 0,
+          vy: 0,
+          A: [
+            0.07,
+            0.013 * Math.sin(i),
+            0.009,
+            -0.003,
+            0.023 * Math.cos(i),
+            0.06,
+            -0.004,
+            0.012,
+          ],
+          B: Array(8).fill(0),
+        })),
+      };
+      const pop = new AnchorPopulation(engine, { population: 65539n });
+      discovery = await AnchorDiscoveryGPU.create({ device, population: pop });
+      const all = [];
+      for (let i = 0; i < engine.count; i++)
+        for (let rank = 0n; rank < pop.counts[i]; rank++)
+          all.push(pop.evaluate(i, rank));
+      const cases = [
+          { x: 0, y: 0, width: 0.18 },
+          { x: 0.07, y: 0.03, width: 0.29, aspectX: 1.8, aspectY: 0.6 },
+          { x: 0.03, y: -0.01, width: 0.25, aspectX: 0.55, aspectY: 1.7 },
+          { x: -0.19, y: -0.15, width: 0.014 },
+          {
+            x: 0.15,
+            y: 0.14,
+            width: 0.13,
+            rankFilter: StellarPopulation.luminosityFilter(10),
+          },
+          { x: 0, y: 0, width: 4, budget: 20000 },
+        ],
+        reports = [];
+      const ids = (p) => p.map((s) => s.id).sort();
+      for (const c of cases) {
+        const r = await discovery.sample(c),
+          expected = all.filter(
+            (p) =>
+              Math.abs(p.x - c.x) <= (c.width * (c.aspectX || 1)) / 2 &&
+              Math.abs(p.y - c.y) <= (c.width * (c.aspectY || 1)) / 2 &&
+              (!c.rankFilter ||
+                c.rankFilter
+                  .forGroup(p.id.slice(0, p.id.lastIndexOf("/")))
+                  .count(BigInt(p.id.slice(p.id.lastIndexOf("/") + 1)), 1n) >
+                  0n),
+          );
+        if (
+          !r.complete ||
+          r.approximate ||
+          JSON.stringify(ids(r.points)) !== JSON.stringify(ids(expected))
+        )
+          throw Error(
+            "GPU/CPU catalogue mismatch " +
+              JSON.stringify({
+                c,
+                actual: r.points.length,
+                expected: expected.length,
+                thinning: r.thinning,
+                missing: ids(expected)
+                  .filter((id) => !r.points.some((p) => p.id === id))
+                  .slice(0, 8),
+              }),
+          );
+        reports.push({ count: r.points.length, ms: r.ms, visited: r.visited });
+      }
+      const reduced = await discovery.sample({
+        x: 0,
+        y: 0,
+        width: 4,
+        budget: 8192,
+      });
+      const reducedExpected = all.filter(
+        (p) => StellarPopulation.variate(p.id) >= 1 - 1 / reduced.thinning,
+      );
+      if (
+        !reduced.complete ||
+        reduced.thinning <= 1 ||
+        JSON.stringify(ids(reduced.points)) !==
+          JSON.stringify(ids(reducedExpected))
+      )
+        throw Error("Uniform luminous-tail thinning mismatch");
+      const empty = await discovery.sample({
+        rankFilter: StellarPopulation.luminosityFilter(1e20),
+      });
+      if (empty.points.length || !empty.complete)
+        throw Error("Empty luminosity tail");
+      const first = await discovery.sample(cases[0]);
+      await discovery.sample(cases[2]);
+      const repeat = await discovery.sample(cases[0]);
+      if (
+        JSON.stringify(ids(first.points)) !== JSON.stringify(ids(repeat.points))
+      )
+        throw Error("History dependent catalogue");
+      // Same physical field under a translated origin: GPU subtracts in CPU double precision.
+      for (const p of engine.anchors) {
+        p.x += 1e8;
+        p.y -= 1e8;
+      }
+      engine.time++;
+      const translated = await discovery.sample({
+        ...cases[0],
+        x: 1e8,
+        y: -1e8,
+      });
+      if (
+        JSON.stringify(ids(first.points)) !==
+        JSON.stringify(ids(translated.points))
+      )
+        throw Error("Origin precision mismatch");
+      // Exercise 24-bit ranks, odd splits and the real production rank-filter salt.
+      const large = new AnchorPopulation(engine, { population: 80000003n }),
+        tail = StellarPopulation.luminosityFilter(1000);
+      const largeQuery = await AnchorDiscoveryGPU.create({
+        device,
+        population: large,
+      });
+      const largeAll = [];
+      for (let i = 0; i < engine.count; i++) {
+        const f = tail.forGroup(large.universe + "/" + i.toString(36)),
+          count = f.count(0n, large.counts[i]);
+        for (let j = 0n; j < count; j++)
+          largeAll.push(large.evaluate(i, f.at(0n, j)));
+      }
+      const highView = {
+        x: 1e8 + 0.03,
+        y: -1e8,
+        width: 0.21,
+        rankFilter: tail,
+      };
+      const high = await largeQuery.sample(highView),
+        highExpected = largeAll.filter(
+          (p) =>
+            Math.abs(p.x - highView.x) <= highView.width / 2 &&
+            Math.abs(p.y - highView.y) <= highView.width / 2,
+        );
+      if (
+        !high.complete ||
+        high.approximate ||
+        JSON.stringify(ids(high.points)) !== JSON.stringify(ids(highExpected))
+      )
+        throw Error("High-rank GPU/CPU mismatch");
+      reports.push({
+        highRanks: true,
+        enumerated: largeAll.length,
+        count: high.points.length,
+        ms: high.ms,
+      });
+      largeQuery.destroy();
+      if (errors.length) throw Error(errors.join("\n"));
+      output.textContent =
+        "PASS " +
+        JSON.stringify({
+          enumerated: all.length,
+          reports,
+          historyIndependent: true,
+          translatedOrigin: true,
+        });
+    } catch (e) {
+      output.textContent = "FAIL " + e.stack;
+    } finally {
+      discovery?.destroy();
+    }
+    await fetch("/result", { method: "POST", body: output.textContent });
+  })();
+</script>

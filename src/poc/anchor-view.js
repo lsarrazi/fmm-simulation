@@ -8,6 +8,7 @@
     population,
     renderer,
     diffuse,
+    discovery,
     ready = false,
     busy = false,
     running = false,
@@ -27,16 +28,21 @@
   const meter = new FrameRateMeter(),
     pan = { x: 0, y: 0 };
   let drag = null;
+  let revision = 0;
+  function invalidate() {
+    dirty = true;
+    revision++;
+  }
   const number = (x) =>
     Number(x).toLocaleString("fr-FR", { maximumFractionDigits: 3 });
-  function shape() {
+  function shape(view = camera) {
     const b = canvas.getBoundingClientRect();
     return renderContext(
       viewportGeometry(b.width, b.height, {
         pixelRatio: devicePixelRatio,
         maxDimension: engine?.device.limits.maxTextureDimension2D ?? 8192,
       }),
-      { worldShortSpan: 4 / camera.zoom, sigmaCss: 1, lengthPc: 10000 },
+      { worldShortSpan: 4 / view.zoom, sigmaCss: 1, lengthPc: 10000 },
     );
   }
   function updateObject() {
@@ -70,10 +76,11 @@
     target = null;
     $("play").disabled = $("advance").disabled = true;
     $("status").textContent = "Création des ancres et de la FMM GPU…";
+    discovery?.destroy();
     diffuse?.destroy();
     renderer?.destroy();
     engine?.destroy();
-    diffuse = renderer = engine = null;
+    discovery = diffuse = renderer = engine = null;
     observationMemo = null;
     lastLight = null;
     previousZoom = 1;
@@ -99,8 +106,12 @@
         device: engine.device,
         population,
       });
+      discovery = await AnchorDiscoveryGPU.create({
+        device: engine.device,
+        population,
+      });
       ready = true;
-      dirty = true;
+      invalidate();
       $("status").textContent = "POC prêt · aucune grille cinétique.";
       canvas.dataset.ready = "true";
     } catch (error) {
@@ -112,23 +123,27 @@
       last = performance.now();
     }
   }
-  function draw() {
+  async function draw() {
     if (tracked) {
       const p = population.resolve(tracked);
       camera.x = p.x + pan.x;
       camera.y = p.y + pan.y;
     }
-    const context = shape(),
+    const drawRevision = revision,
+      frameCamera = { ...camera },
+      frameSelected = selected,
+      frameTracked = tracked;
+    const context = shape(frameCamera),
       view = {
-        x: camera.x,
-        y: camera.y,
+        x: frameCamera.x,
+        y: frameCamera.y,
         width: context.worldSpan,
         aspectX: context.aspectX,
         aspectY: context.aspectY,
       },
       projection = population.windowProjection(view);
     projection.cameraWidth = context.worldShortSpan;
-    projection.zoom = camera.zoom;
+    projection.zoom = frameCamera.zoom;
     projection.fovDegrees = 50;
     const budget = Math.max(
         0,
@@ -143,20 +158,8 @@
         onset,
       });
     const started = performance.now();
-    let threshold = minimumLuminosity(projection, optics),
+    const threshold = minimumLuminosity(projection, optics),
       filter = StellarPopulation.luminosityFilter(threshold);
-    for (
-      let i = 0;
-      i < 32 &&
-      filter.fraction > 0 &&
-      filter.fraction * projection.expected > budget * 0.6;
-      i++
-    ) {
-      threshold *= 2;
-      const next = StellarPopulation.luminosityFilter(threshold);
-      if (!next.fraction) break;
-      filter = next;
-    }
     const signature = [
       budget,
       filter.key,
@@ -193,7 +196,11 @@
     } else {
       lastSample =
         enabled && filter.fraction > 0
-          ? population.sample({ ...view, budget, rankFilter: filter })
+          ? await (discovery || population).sample({
+              ...view,
+              budget,
+              rankFilter: filter,
+            })
           : { points: [], visited: 0, approximate: false, shortfall: 0 };
       let speed = 0;
       for (const p of engine.anchors) {
@@ -211,29 +218,20 @@
         ids: lastSample.points.map((p) => p.id),
       };
     }
-    const { knownIds, priorIds } = POCStellarVisibility.history(
+    const { priorIds } = POCStellarVisibility.history(
       lastLight?.sources || [],
       {
         enabled,
-        zoom: camera.zoom,
+        zoom: frameCamera.zoom,
         previousZoom,
       },
     );
-    const candidates = new Map(lastSample.points.map((p) => [p.id, p]));
-    for (const id of knownIds) {
-      const p = population.resolve(id);
+    points = lastSample.points;
+    if (frameSelected && enabled) {
+      const p = population.resolve(frameSelected);
       if (
-        Math.abs(p.x - camera.x) <= context.worldWidth / 2 &&
-        Math.abs(p.y - camera.y) <= context.worldHeight / 2
-      )
-        candidates.set(id, p);
-    }
-    points = [...candidates.values()];
-    if (selected && budget > 0 && !$("densityOnly").checked) {
-      const p = population.resolve(selected);
-      if (
-        Math.abs(p.x - camera.x) < context.worldWidth / 2 &&
-        Math.abs(p.y - camera.y) < context.worldHeight / 2 &&
+        Math.abs(p.x - frameCamera.x) < context.worldWidth / 2 &&
+        Math.abs(p.y - frameCamera.y) < context.worldHeight / 2 &&
         !points.some((q) => q.id === p.id)
       )
         points = [...points, p];
@@ -243,16 +241,16 @@
           ...optics,
           budget,
           priorIds,
-          selectedId: selected,
+          selectedId: frameSelected,
         })
       : [];
-    previousZoom = camera.zoom;
+    previousZoom = frameCamera.zoom;
     searchMs = performance.now() - started;
     renderer.resize(context.pixelWidth, context.pixelHeight);
     lastLight = renderer.render(null, projection, points, {
       ...optics,
       detailWeight: enabled ? 1 : 0,
-      selected,
+      selected: frameSelected,
       complete: false,
       lengthPc: 10000,
       opticalShape: DEFAULT_OPTICAL_SHAPE,
@@ -265,15 +263,22 @@
       context,
     });
     // Picking uses this exact frame, never a live camera awaiting a new image.
-    canvas._frame = { camera: { ...camera }, context, points: lastLight.drawn };
+    canvas._frame = {
+      camera: { ...frameCamera },
+      context,
+      points: lastLight.drawn,
+    };
     canvas.dataset.time = String(engine.time);
     canvas.dataset.sources = String(lastLight.sources.length);
     canvas.dataset.selectedPeak = String(
-      lastLight.sources.find((p) => p.id === selected)?.peak ?? 0,
+      lastLight.sources.find((p) => p.id === frameSelected)?.peak ?? 0,
     );
-    canvas.dataset.followed = tracked || "";
+    canvas.dataset.followed = frameTracked || "";
     canvas.dataset.visited = String(lastSample.visited);
     canvas.dataset.approximate = String(lastSample.approximate);
+    canvas.dataset.discoveryBackend = lastSample.backend || "none";
+    canvas.dataset.discoveryThinning = String(lastSample.thinning || 1);
+    canvas.dataset.searchMs = String(searchMs);
     canvas.dataset.backend = "GPU FMM anchors";
     canvas.dataset.diffuseBackend = diffuse.work.backend;
     $("time").textContent = number(engine.time) + " My";
@@ -282,14 +287,14 @@
       " ancres · " +
       number(lastLight.sources.length) +
       " sources\n×" +
-      number(camera.zoom) +
+      number(frameCamera.zoom) +
       " · champ " +
       number(context.worldWidth * 10000) +
       " × " +
       number(context.worldHeight * 10000) +
       " pc";
     updateObject();
-    dirty = false;
+    dirty = revision !== drawRevision;
   }
   async function loop(now) {
     const elapsed = Math.min(0.1, Math.max(0, (now - last) / 1000));
@@ -313,9 +318,9 @@
             $("advance").disabled = false;
             $("status").textContent = "Époque atteinte.";
           }
-          dirty = true;
+          invalidate();
         }
-        if (dirty) draw();
+        if (dirty) await draw();
         meter.tick(performance.now());
         if (now - lastStats > 500) {
           lastStats = now;
@@ -332,12 +337,13 @@
               : "nouvelle recherche") +
             "\nNœuds visités : " +
             number(lastSample?.visited || 0) +
-            "\nRecherche : " +
-            (lastSample?.approximate
-              ? "approximation bornée"
-              : "résolution demandée atteinte") +
-            "\nSources manquantes au budget : " +
-            number(lastSample?.shortfall || 0) +
+            "\nCatalogue : " +
+            (lastSample?.backend || "désactivé") +
+            (lastSample?.complete
+              ? " · parcours terminé"
+              : " · recherche approchée") +
+            "\nFraction parcourue : 1/" +
+            number(lastSample?.thinning || 1) +
             "\nΔ moment cinétique : " +
             number(
               ((d.angularMomentum - engine.initialAngular) /
@@ -386,14 +392,14 @@
   };
   for (const id of ["sourceBudget", "sourceOnset", "exposure", "densityOnly"])
     $(id).oninput = () => {
-      dirty = true;
+      invalidate();
     };
   $("diagnostic").onclick = () => {
     tracked = null;
     camera.x = -0.208141793;
     camera.y = 0.120666986;
     camera.zoom = 80;
-    dirty = true;
+    invalidate();
     $("status").textContent =
       "Région physique du diagnostic. Atteindre 26,5 My pour comparer ; les identités de ce POC sont distinctes.";
   };
@@ -402,7 +408,7 @@
       const p = population.resolve($("reference").value.trim());
       selected = tracked = p.id;
       pan.x = pan.y = 0;
-      dirty = true;
+      invalidate();
       $("status").textContent = "Objet suivi.";
     } catch (error) {
       $("status").textContent = error.message;
@@ -414,7 +420,7 @@
   };
   $("release").onclick = () => {
     tracked = null;
-    dirty = true;
+    invalidate();
   };
   canvas.addEventListener(
     "wheel",
@@ -424,7 +430,7 @@
         1,
         Math.min(1e9, camera.zoom * Math.exp(-e.deltaY * 0.002)),
       );
-      dirty = true;
+      invalidate();
     },
     { passive: false },
   );
@@ -457,7 +463,7 @@
       camera.x = drag.camera.x - dx * drag.scale;
       camera.y = drag.camera.y + dy * drag.scale;
     }
-    dirty = true;
+    invalidate();
   });
   canvas.addEventListener("pointerup", (e) => {
     if (!drag) return;
@@ -485,7 +491,7 @@
       selected = pick.id;
       $("reference").value = selected;
       if (saved.button === 1) follow();
-      dirty = true;
+      invalidate();
     }
   });
   canvas.addEventListener("pointercancel", () => {
@@ -495,9 +501,10 @@
     if (e.button === 1) e.preventDefault();
   });
   new ResizeObserver(() => {
-    dirty = true;
+    invalidate();
   }).observe($("viewport"));
   window.addEventListener("beforeunload", () => {
+    discovery?.destroy();
     diffuse?.destroy();
     renderer?.destroy();
     engine?.destroy();

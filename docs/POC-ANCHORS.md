@@ -44,11 +44,17 @@ La luminosité reçue d'une étoile ne dépend plus du nombre total de sources e
 
 Le champ « Sensibilité d’apparition » règle désormais le seuil du détecteur : seuil de pic = 0,000125 × 160 / sensibilité. Sa valeur par défaut reste 160. Une valeur supérieure permet de détecter des signaux plus faibles sans augmenter leur luminosité. Cette sémantique remplace l'ancien raccord fondé sur le nombre d'étoiles dans la fenêtre.
 
-Les candidates détectables sont classées par flux visible reçu. À zoom constant ou croissant, les sources visibles déjà connues sont conservées dans le budget tant qu'elles restent dans le cadre et au-dessus du seuil. Leurs positions, vitesses et flux sont réévalués. Le dézoom ne donne pas cette priorité. Il conserve toutefois les identités déjà connues dans le vivier de candidates, avec leurs coordonnées et leur flux réévalués : absence de priorité ne signifie pas suppression avant classement. Une recherche fraîche incomplète ne doit pas effacer une source encore admissible lorsque le budget suffit. La découverte demeure approximative ; ce mécanisme ne crée pas de nouvelles identités et ne fixe pas les positions.
+Les candidates détectables sont classées par flux visible reçu. À zoom constant ou croissant, les identités présentes dans la nouvelle recherche gardent leur priorité dans le budget. Le dézoom supprime cette priorité. **Aucune ancienne liste spatiale n'est réinjectée** : elle créait un rectangle de surdensité correspondant au champ précédemment exploré.
+
+La découverte utilise maintenant un parcours GPU des intervalles de rangs immuables de chaque cohorte 4D. Le GPU renvoie des couples ancre/rang ; les coordonnées finales et la découpe exacte du champ sont réévaluées en double précision sur CPU. Les bornes GPU sont conservatrices pour absorber les erreurs de précision ; elles n'agrandissent pas le champ rendu. Les probabilités de queue sont calculées séparément pour éviter la perte de précision de 1−p près de 1.
+
+La liste de retour est bornée entre 32 768 et 262 144 candidates selon le plafond choisi. Le travail est limité globalement à environ 8,4 millions de nœuds par tentative, avec des réservations par blocs de 64 pour éviter une opération atomique par nœud. Si la population estimée dépasse la capacité, ou si le parcours déborde, une fraction lumineuse plus restreinte du même catalogue est parcourue uniformément dans tout le champ. Ce filtre déterministe privilégie les luminosités intrinsèques élevées et ne dépend pas des anciennes fenêtres. Un préfixe de parcours inachevé n'est jamais affiché. Cela demeure une approximation de visibilité lorsque le catalogue est réduit, puis plafonné ; ce n'est pas une sélection exhaustive des flux apparents sur toute la population.
+
+Cette voie prend en charge les rangs par cohorte jusqu'à 2³¹−1, ce qui couvre les 100 milliards d'étoiles du POC. Les populations théoriques plus grandes gardent la recherche CPU approchée. Après huit tentatives GPU non concluantes, le repli CPU est également signalé. Les diagnostics distinguent parcours terminé, fraction parcourue et repli. Une lecture bornée d'identités GPU→CPU est ajoutée lors d'une nouvelle recherche. Un cadrage presque inchangé peut réutiliser la liste pendant moins de 10 ans simulés et 0,25 pixel de déplacement, comme auparavant. La caméra d'une image reste figée pendant la requête asynchrone ; les entrées reçues entre-temps déclenchent l'image suivante.
 
 Régression reproduite à 10 000 ancres : en suivant une identité de référence, l'ancien affichage passait d'environ 460 sources à 5 entre 0 et 5 Myr, alors que la densité locale augmentait. Après correction, le test donne 461 puis 465 sources, avec un signal de l'étoile suivie identique à toutes les époques testées jusqu'à 26,5 Myr. Les autres étoiles peuvent réellement entrer ou sortir du cadre. La recherche incomplète et la validité à long terme du transport restent des limites séparées.
 
-Régression de dézoom : simulation figée, passage de ×40 000 à ×35 000, population théorique dans le cadre de 1 670 à 2 182 objets, plafond 8 192. Avant correction, 31 sources encore détectables étaient perdues par défaut de redécouverte. Après correction, zéro perte de ce type ; les 33 autres disparitions correspondent au seuil photométrique. Le test vérifie aussi ×30 000 → ×25 000, ×10 000 → ×9 000 et ×2 000 → ×1 800. Les tests de sélection à budget saturé vérifient qu'une source connue peut être évincée par une plus lumineuse au dézoom.
+Régression de dézoom : à ×40 000 → ×35 000, population estimée 1 670 → 2 182, plafond 8 192 : zéro perte de source encore détectable dans le test, 42 disparitions liées au seuil photométrique. Même vérification à ×30 000 → ×25 000. Les cadrages saturés sont testés séparément : le même cadrage final, atteint après différentes fenêtres, doit produire exactement le même ensemble d'identités au dézoom. Ces essais vérifient l'indépendance du chemin, pas une complétude physique dans les champs saturés.
 
 ## Limites à évaluer avant une adoption
 
@@ -57,8 +63,8 @@ Ce POC teste une représentation, sans démontrer qu'elle remplace fidèlement l
 1. La déformation de chaque gaussienne reste linéaire. Elle ne décrit pas correctement tous les replis non linéaires de l'espace des phases après une évolution longue. Une extension adaptative ou un modèle de transport plus riche sera probablement nécessaire.
 2. Les ancres portent la gravité adoucie ; leurs distributions gaussiennes reconstruites n'alimentent pas à leur tour une résolution de champ exacte. La cohérence entre ces deux représentations de masse est approximative.
 3. La reconstruction est lissée à une résolution numérique finie. L'absence de coupure ne suffit pas à prouver une densité correcte. Il reste à comparer profils radiaux, distributions de vitesse, énergie et évolution des structures avec des références à résolution croissante.
-4. La découverte 4D est actuellement incomplète à travail borné. Elle demeure le principal coût lors des déplacements ou changements d'échelle. Un noyau de densité régulier ne garantit pas à lui seul un catalogue affiché sans variation d'échantillonnage.
-5. Le calcul des matrices, la découverte, l'intégrale de population visible et la préparation des instances utilisent encore le CPU. Le FMM et la lumière utilisent le GPU. Ce n'est pas une promesse de 60 FPS, notamment en avance rapide.
+4. La découverte GPU est complète sur le sous-catalogue lumineux finalement admis lorsqu’un parcours termine, sous réserve des tolérances numériques testées. Ce sous-catalogue peut être réduit dans les champs chargés ; le repli CPU demeure incomplet. Des changements globaux de sélection restent possibles en changeant de fraction ou en saturant le plafond.
+5. Le calcul des matrices, l’intégrale de population visible et la préparation des instances utilisent encore le CPU. La découverte, le FMM et la lumière utilisent le GPU ; les identités retournées sont évaluées sur CPU. Ce n'est pas une promesse de 60 FPS, notamment en avance rapide.
 6. Pas de FMM de rencontres entre étoiles inférées, pas de systèmes planétaires et pas de migration des anciennes identités dans ce POC. Ces fonctions restent dans l'application principale.
 
 ## Validation
@@ -68,6 +74,7 @@ npm test
 npm run test:anchors
 npm run test:anchors-ui
 npm run test:anchors-dezoom
+npm run test:anchor-discovery
 npm run test:diffuse
 node test-gpu-runner.cjs --local --hardware
 ```
@@ -86,7 +93,7 @@ Chaque noyau est une ellipse additive. La covariance projetée reçoit uniquemen
 
 Le facteur de normalisation dépend du déterminant de cette covariance : élargir le filtre ne crée pas de lumière. Le modèle de matière est inchangé par le zoom. Le terme 1/12 est la variance d'un pixel de largeur un ; il approxime l'intégration du pixel et n'est pas une intégrale rectangulaire exacte. Le diffus n'applique pas ici les ailes non gaussiennes du halo et des aigrettes, qui restent propres aux sources individuelles du moteur optique.
 
-Une première passe accumule la densité dans une texture native R16FLOAT (deux octets par pixel). Une deuxième applique l'exposition, la réponse géométrique et la fraction lumineuse non résolue, avant l'ajout des étoiles dans le même tampon HDR. Les calculs d'occupation utilisent la densité au pixel natif. Les covariances de la matière, le filtrage optique et la composition demeurent séparés. Aucune lecture GPU vers CPU n'est ajoutée à la boucle.
+Une première passe accumule la densité dans une texture native R16FLOAT (deux octets par pixel). Une deuxième applique l'exposition, la réponse géométrique et la fraction lumineuse non résolue, avant l'ajout des étoiles dans le même tampon HDR. Les calculs d'occupation utilisent la densité au pixel natif. Les covariances de la matière, le filtrage optique et la composition demeurent séparés. Cette projection diffuse n’exige aucune lecture GPU vers CPU ; la nouvelle découverte d’identités décrite plus haut a sa propre lecture bornée.
 
 L'ancienne méthode CPU project() est conservée comme référence de test ; l'interface du POC ne l'appelle plus. Le test d'interface remplace même cette méthode par une erreur pour vérifier l'absence de retour à cette voie.
 
@@ -95,3 +102,7 @@ Validation : cas sous-pixel, ellipses tournées, translation sous-pixel, portrai
 Mesures indicatives : environ 5 ms par image pour 10 000 noyaux en 1280 × 720, intégrale de population et attente GPU incluses ; environ 60 FPS dans l'essai d'interface de suivi à 1 année/s après cette modification. La découverte de nouvelles sources reste le coût dominant lors de certains changements de cadrage. Ces résultats ne garantissent pas la même cadence à toute résolution ou à toute époque.
 
 Les rapports complets restent dans validation-results/, ignoré par Git.
+
+Le test de découverte compare les ensembles d’identités GPU à une énumération CPU indépendante de 65 539 objets : fenêtres carrées, paysage et portrait, queues peu denses, filtre lumineux, catalogue entier et origine translatée de 10⁸ unités. Un second catalogue vérifie les rangs de l’ordre de dix millions avec le filtre lumineux de production. Il vérifie aussi l’indépendance de l’historique des requêtes.
+
+Mesures de la recherche GPU complète (100 milliards d’identités, 10 000 ancres, plafond 8 192) : environ 64 ms au champ ×84, 254 ms au champ ×1 800 et 462–527 ms aux petits champs ×35 000 / ×25 000. Ces durées incluent recherche, lecture des identités et sélection des sources ; elles concernent une nouvelle fenêtre, pas le rendu réutilisé à caméra fixe. La cohérence spatiale est corrigée, mais la navigation dans les petites fenêtres nécessite encore une optimisation : ce changement ne garantit pas 60 FPS en déplacement.

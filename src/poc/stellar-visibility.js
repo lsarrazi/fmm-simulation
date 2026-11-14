@@ -21,12 +21,13 @@
       detailWeight: 1,
     };
   }
-  // A known identity remains a valid discovery candidate in either direction.
-  // Only its priority is removed on zoom-out; photometry and the budget still
-  // decide whether it is rendered. This does not freeze its position or flux.
+  // History affects priority only. The current spatial query supplies every
+  // candidate; carrying an old rectangular sample biases the new viewport.
   function history(previousSources, { enabled, zoom, previousZoom }) {
-    const knownIds = enabled ? previousSources.map((p) => p.id) : [];
-    return { knownIds, priorIds: zoom >= previousZoom ? knownIds : [] };
+    return {
+      priorIds:
+        enabled && zoom >= previousZoom ? previousSources.map((p) => p.id) : [],
+    };
   }
   function select(
     projection,
