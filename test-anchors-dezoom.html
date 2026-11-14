@@ -1,0 +1,132 @@
+<!doctype html><meta charset="utf-8" /><iframe
+  id="app"
+  src="poc-anchors.html"
+  width="1500"
+  height="1000"
+></iframe>
+<pre id="output">RUNNING</pre>
+<script>
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+    wait = async (f) => {
+      for (let i = 0; i < 1200; i++) {
+        if (f()) return;
+        await sleep(25);
+      }
+      throw Error("Timeout");
+    };
+  (async () => {
+    try {
+      await wait(
+        () =>
+          app.contentDocument?.getElementById("scene")?.dataset.ready ===
+          "true",
+      );
+      const w = app.contentWindow,
+        d = app.contentDocument,
+        $ = (id) => d.getElementById(id),
+        canvas = $("scene");
+      await wait(() => canvas.dataset.time === "0");
+      let snapshot = null;
+      const original = w.GPUStellarLightRenderer.prototype.render;
+      w.GPUStellarLightRenderer.prototype.render = function (
+        c,
+        p,
+        points,
+        options,
+      ) {
+        const result = original.call(this, c, p, points, options);
+        snapshot = { projection: p, points, options, result };
+        return result;
+      };
+      $("diagnostic").click();
+      await wait(() => snapshot && canvas._frame.camera.zoom === 80);
+      const zoom = async (value) => {
+        snapshot = null;
+        const old = canvas._frame.camera.zoom;
+        canvas.dispatchEvent(
+          new w.WheelEvent("wheel", {
+            deltaY: -Math.log(value / old) / 0.002,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+        await wait(
+          () =>
+            snapshot && Math.abs(canvas._frame.camera.zoom / value - 1) < 1e-9,
+        );
+        return snapshot;
+      };
+      const reports = [];
+      for (const [close, wide] of [
+        [40000, 35000],
+        [30000, 25000],
+        [10000, 9000],
+        [2000, 1800],
+      ]) {
+        const before = await zoom(close),
+          after = await zoom(wide),
+          afterIds = new Set(after.result.sources.map((p) => p.id)),
+          lost = before.result.sources.filter((p) => !afterIds.has(p.id)),
+          detectable = w.lightPlan(
+            after.projection,
+            lost,
+            after.options,
+          ).sources;
+        let threshold = w.minimumLuminosity(after.projection, after.options),
+          filter = w.StellarPopulation.luminosityFilter(threshold);
+        for (
+          let i = 0;
+          i < 32 &&
+          filter.fraction > 0 &&
+          filter.fraction * after.projection.expected > 8192 * 0.6;
+          i++
+        ) {
+          threshold *= 2;
+          const next = w.StellarPopulation.luminosityFilter(threshold);
+          if (!next.fraction) break;
+          filter = next;
+        }
+        const eligible = detectable.filter((p) => {
+          const cut = p.id.lastIndexOf("/");
+          return (
+            filter
+              .forGroup(p.id.slice(0, cut))
+              .count(BigInt(p.id.slice(cut + 1)), 1n) > 0n
+          );
+        });
+        if (after.projection.expected < 8192 && eligible.length)
+          throw Error(
+            "Detectable sources lost under the source budget: " +
+              eligible.length,
+          );
+        reports.push({
+          close,
+          wide,
+          expectedBefore: before.projection.expected,
+          expectedAfter: after.projection.expected,
+          before: before.result.sources.length,
+          after: after.result.sources.length,
+          lost: lost.length,
+          legitimateBelowThreshold: lost.length - detectable.length,
+          detectableLost: detectable.length,
+          filterEligibleLost: eligible.length,
+          filter: filter.key,
+          visited: canvas.dataset.visited,
+          approximate: canvas.dataset.approximate,
+          example: eligible[0] && {
+            id: eligible[0].id,
+            peakBefore: before.result.sources.find(
+              (p) => p.id === eligible[0].id,
+            ).peak,
+            peakAfter: eligible[0].peak,
+            minimumPeak: after.options.minimumPeak,
+          },
+        });
+      }
+      output.textContent = "PASS " + JSON.stringify({ reports });
+    } catch (e) {
+      output.textContent = "FAIL " + e.stack;
+    }
+    await fetch("/result", { method: "POST", body: output.textContent });
+  })();
+</script>

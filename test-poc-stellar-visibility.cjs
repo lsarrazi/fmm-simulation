@@ -89,6 +89,57 @@ assert.equal(
   "near",
   "rank by received flux, including camera distance",
 );
+const out = V.history([a], { enabled: true, zoom: 900, previousZoom: 1000 });
+assert.deepEqual(out.knownIds, ["retained"]);
+assert.deepEqual(
+  out.priorIds,
+  [],
+  "zoom-out removes priority, not knowledge of real candidates",
+);
+const known = new Map([[a.id, a]]);
+const candidates = [b, ...out.knownIds.map((id) => known.get(id))];
+assert.deepEqual(
+  new Set(
+    V.select(projection(1e6), candidates, {
+      ...optics,
+      budget: 2,
+      priorIds: out.priorIds,
+    }).map((p) => p.id),
+  ),
+  new Set(["retained", "new-bright"]),
+  "under budget, a still-detectable known source survives an incomplete fresh discovery",
+);
+assert.equal(
+  V.select(projection(1e6), candidates, {
+    ...optics,
+    budget: 1,
+    priorIds: out.priorIds,
+  })[0].id,
+  "new-bright",
+  "under budget pressure, zoom-out does not favour history",
+);
+assert.equal(
+  V.select(projection(1e6), [b, star("retained", 1, 1)], {
+    ...optics,
+    budget: 2,
+    priorIds: out.priorIds,
+  }).length,
+  1,
+  "out-of-frame sources are discarded",
+);
+assert.equal(
+  V.select(projection(1e6), [b, star("retained", 0.000001)], {
+    ...optics,
+    budget: 2,
+    priorIds: out.priorIds,
+  }).length,
+  1,
+  "sources below the detector threshold are discarded",
+);
+assert.deepEqual(
+  V.history([a], { enabled: false, zoom: 1, previousZoom: 2 }).knownIds,
+  [],
+);
 console.log(
   "Passed: density-independent stellar flux and detection, sensitivity, apparent-flux priority and optional source retention.",
 );

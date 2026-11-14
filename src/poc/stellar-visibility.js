@@ -21,6 +21,13 @@
       detailWeight: 1,
     };
   }
+  // A known identity remains a valid discovery candidate in either direction.
+  // Only its priority is removed on zoom-out; photometry and the budget still
+  // decide whether it is rendered. This does not freeze its position or flux.
+  function history(previousSources, { enabled, zoom, previousZoom }) {
+    const knownIds = enabled ? previousSources.map((p) => p.id) : [];
+    return { knownIds, priorIds: zoom >= previousZoom ? knownIds : [] };
+  }
   function select(
     projection,
     points,
@@ -44,6 +51,7 @@
     }
     return selected;
   }
-  root.POCStellarVisibility = { options, select };
-  if (typeof module !== "undefined") module.exports = { options, select };
+  root.POCStellarVisibility = { options, select, history };
+  if (typeof module !== "undefined")
+    module.exports = { options, select, history };
 })(typeof window !== "undefined" ? window : globalThis);

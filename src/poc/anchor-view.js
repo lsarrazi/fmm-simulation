@@ -211,12 +211,16 @@
         ids: lastSample.points.map((p) => p.id),
       };
     }
-    const priorIds =
-      enabled && camera.zoom >= previousZoom
-        ? (lastLight?.sources || []).map((p) => p.id)
-        : [];
+    const { knownIds, priorIds } = POCStellarVisibility.history(
+      lastLight?.sources || [],
+      {
+        enabled,
+        zoom: camera.zoom,
+        previousZoom,
+      },
+    );
     const candidates = new Map(lastSample.points.map((p) => [p.id, p]));
-    for (const id of priorIds) {
+    for (const id of knownIds) {
       const p = population.resolve(id);
       if (
         Math.abs(p.x - camera.x) <= context.worldWidth / 2 &&

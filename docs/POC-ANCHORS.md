@@ -44,9 +44,11 @@ La luminosité reçue d'une étoile ne dépend plus du nombre total de sources e
 
 Le champ « Sensibilité d’apparition » règle désormais le seuil du détecteur : seuil de pic = 0,000125 × 160 / sensibilité. Sa valeur par défaut reste 160. Une valeur supérieure permet de détecter des signaux plus faibles sans augmenter leur luminosité. Cette sémantique remplace l'ancien raccord fondé sur le nombre d'étoiles dans la fenêtre.
 
-Les candidates détectables sont classées par flux visible reçu. À zoom constant ou croissant, les sources visibles déjà connues sont conservées dans le budget tant qu'elles restent dans le cadre et au-dessus du seuil. Leurs positions, vitesses et flux sont réévalués. Le dézoom ne donne pas cette priorité. La découverte demeure approximative ; ce mécanisme ne crée pas de nouvelles identités et ne fixe pas les positions.
+Les candidates détectables sont classées par flux visible reçu. À zoom constant ou croissant, les sources visibles déjà connues sont conservées dans le budget tant qu'elles restent dans le cadre et au-dessus du seuil. Leurs positions, vitesses et flux sont réévalués. Le dézoom ne donne pas cette priorité. Il conserve toutefois les identités déjà connues dans le vivier de candidates, avec leurs coordonnées et leur flux réévalués : absence de priorité ne signifie pas suppression avant classement. Une recherche fraîche incomplète ne doit pas effacer une source encore admissible lorsque le budget suffit. La découverte demeure approximative ; ce mécanisme ne crée pas de nouvelles identités et ne fixe pas les positions.
 
 Régression reproduite à 10 000 ancres : en suivant une identité de référence, l'ancien affichage passait d'environ 460 sources à 5 entre 0 et 5 Myr, alors que la densité locale augmentait. Après correction, le test donne 461 puis 465 sources, avec un signal de l'étoile suivie identique à toutes les époques testées jusqu'à 26,5 Myr. Les autres étoiles peuvent réellement entrer ou sortir du cadre. La recherche incomplète et la validité à long terme du transport restent des limites séparées.
+
+Régression de dézoom : simulation figée, passage de ×40 000 à ×35 000, population théorique dans le cadre de 1 670 à 2 182 objets, plafond 8 192. Avant correction, 31 sources encore détectables étaient perdues par défaut de redécouverte. Après correction, zéro perte de ce type ; les 33 autres disparitions correspondent au seuil photométrique. Le test vérifie aussi ×30 000 → ×25 000, ×10 000 → ×9 000 et ×2 000 → ×1 800. Les tests de sélection à budget saturé vérifient qu'une source connue peut être évincée par une plus lumineuse au dézoom.
 
 ## Limites à évaluer avant une adoption
 
@@ -65,6 +67,7 @@ Ce POC teste une représentation, sans démontrer qu'elle remplace fidèlement l
 npm test
 npm run test:anchors
 npm run test:anchors-ui
+npm run test:anchors-dezoom
 npm run test:diffuse
 node test-gpu-runner.cjs --local --hardware
 ```
