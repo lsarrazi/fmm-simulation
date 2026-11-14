@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Orbit · POC ancres</title>
+    <link rel="stylesheet" href="poc-anchors.css" />
+  </head>
+  <body>
+    <header>
+      <a href="comparison.html">← Orbit · moteur actuel</a
+      ><strong>ANCRES · laboratoire</strong><output id="fps">—</output>
+    </header>
+    <main>
+      <section id="viewport">
+        <canvas id="scene" aria-label="Galaxie expérimentale à ancres"></canvas
+        ><output id="hud"></output
+        ><span id="help"
+          >Molette : zoom · glisser : cadrer · clic : inspecter · clic molette :
+          suivre</span
+        >
+      </section>
+      <aside>
+        <h1>Une galaxie sans grille cinétique</h1>
+        <p class="note">
+          Les ancres représentent des populations, pas des étoiles géantes. Les
+          étoiles gardent une identité déterministe dans des nuages gaussiens 4D
+          qui se recouvrent.
+        </p>
+        <label
+          >Ancres numériques<select id="anchorCount">
+            <option>4096</option>
+            <option selected>10000</option>
+            <option>16384</option>
+          </select></label
+        ><button id="reset">Recommencer avec ces ancres</button>
+        <label
+          >Sources lumineuses maximum<input
+            id="sourceBudget"
+            type="number"
+            min="0"
+            max="65536"
+            step="1"
+            value="8192" /></label
+        ><label
+          >Facteur d’apparition<input
+            id="sourceOnset"
+            type="number"
+            min="1"
+            value="160" /></label
+        ><label
+          >Exposition · EV<input
+            id="exposure"
+            type="number"
+            min="-40"
+            max="16"
+            step=".5"
+            value="-4.5"
+        /></label>
+        <label class="check"
+          ><input id="densityOnly" type="checkbox" /> Densité seule ·
+          diagnostic</label
+        ><button id="diagnostic">Observer la région de la coupure</button>
+        <h2>Objet et référentiel</h2>
+        <label
+          >Identité dans ce POC<input
+            id="reference"
+            type="text"
+            spellcheck="false"
+            placeholder="Sélectionner une étoile ou saisir son identité"
+        /></label>
+        <div class="row">
+          <button id="follow">Suivre</button><button id="release">Libre</button>
+        </div>
+        <output id="object">Aucun objet sélectionné.</output>
+        <h2>Mesures</h2>
+        <output id="stats"></output
+        ><output id="status" role="status">Initialisation…</output>
+        <p class="note">
+          POC : gravité FMM GPU adoucie, halo lisse, nuages déformés par une
+          approximation linéaire des marées. Pas de système planétaire ni de
+          rencontres stellaires locales. La recherche des sources est bornée et
+          signale son approximation.
+        </p>
+      </aside>
+    </main>
+    <footer>
+      <button id="play" disabled>Démarrer</button
+      ><label
+        >Durée simulée par seconde<span class="row"
+          ><input id="rate" type="number" min="0" step="any" value="1" /><select
+            id="rateUnit"
+          >
+            <option value="0.000001" selected>années/s</option>
+            <option value="1">millions d’années/s</option>
+          </select></span
+        ></label
+      ><label
+        >Avancer jusqu’à · My<span class="row"
+          ><input
+            id="targetTime"
+            type="number"
+            min="0"
+            step=".5"
+            value="26.5"
+          /><button id="advance" disabled>Atteindre</button></span
+        ></label
+      ><output id="time">0 My</output>
+    </footer>
+    <script src="stellar-population.js"></script>
+    <script src="milky-way.js"></script>
+    <script src="fmm-gpu-compute.js"></script>
+    <script src="src/observation/camera-frame.js"></script>
+    <script src="observation-tools.js"></script>
+    <script src="stellar-light.js"></script>
+    <script src="stellar-light-gpu.js"></script>
+    <script src="src/poc/anchor-engine.js"></script>
+    <script src="src/poc/anchor-population.js"></script>
+    <script src="src/poc/anchor-view.js"></script>
+  </body>
+</html>

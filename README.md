@@ -2,6 +2,8 @@
 
 Simulation galactique à deux niveaux : distribution collective et étoiles déterministes inférées, puis système orbital local. Calcul et rendu WebGPU, références CPU et tests de déterminisme.
 
+Sur la branche `poc/anchor-galaxy`, un [prototype séparé à ancres numériques](docs/POC-ANCHORS.md) est accessible à `/poc-anchors.html`. Il ne remplace pas le moteur actuel.
+
 ## Démarrer
 
 Avec Node.js 22 ou ultérieur :
