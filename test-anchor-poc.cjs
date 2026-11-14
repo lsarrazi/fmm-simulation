@@ -54,6 +54,22 @@ const {
     Math.abs(projected.mass - 1) < 1e-6,
     "Gaussian projection conserves mass when the cloud is enclosed",
   );
+  const metadata = population.windowProjection({ x: 0.5, y: -0.3, width: 2 });
+  assert.equal(
+    metadata.image.length,
+    1,
+    "observation metadata must not allocate a spatial raster",
+  );
+  assert(Math.abs(metadata.viewMass - 1) < 1e-12);
+  assert.equal(
+    metadata.expected,
+    Number(population.population) * metadata.viewMass,
+  );
+  assert.equal(
+    population.gaussians(),
+    population.gaussians(),
+    "frozen physics can reuse covariance preparation",
+  );
   const sample = population.sample({
     x: 0.51,
     y: -0.3,

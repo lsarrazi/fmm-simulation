@@ -24,7 +24,7 @@ Clic : inspecter ; clic molette : suivre ; glisser molette : décaler le cadrage
 - Les matrices de position `A` et de vitesse `B` évoluent avec l'équation variationnelle linéarisée autour de l'ancre. Le tenseur de marée est estimé sur 32 × 32 points cibles sans masse, via le même calcul FMM, puis différencié et interpolé.
 - La densité projetée est la somme analytique des gaussiennes `A Aᵀ`. Elle n'utilise pas un flou ajouté à une distribution trouée. Les noyaux se recouvrent et n'ont pas les frontières rectangulaires strictes de l'ancien modèle.
 
-Il n'y a aucun solveur cinétique ni tampon `(x,y,vx,vy)` discret. La petite grille de cibles échantillonne uniquement les dérivées du champ de force ; elle ne transporte pas de matière. Le calcul de densité pour l'affichage reste une rasterisation CPU bornée ; la lumière et le rendu final réutilisent le moteur optique GPU.
+Il n'y a aucun solveur cinétique ni tampon `(x,y,vx,vy)` discret. La petite grille de cibles échantillonne uniquement les dérivées du champ de force ; elle ne transporte pas de matière. La lumière diffuse est projetée directement sur le GPU à la résolution native, sans grille intermédiaire de densité. Le CPU prépare les covariances et estime la population contenue dans la fenêtre ; il ne fabrique plus une image diffuse 96 × 96. Le raccord avec les sources individuelles réutilise la politique lumineuse existante.
 
 ## Identités et recherche locale
 
@@ -32,7 +32,7 @@ Adresse : `anchors:v1:seed:nombreAncres:population/ancreEnBase36/rang`. Les rang
 
 Un arbre binaire déterministe dans les quatre coordonnées uniformes initiales permet de retrouver un rang. Une transformation normale donne les quatre coordonnées latentes. Ces coordonnées restent inchangées : position et vitesse sont évaluées avec les matrices courantes de la même ancre. Il n'y a aucune réaffectation à l'ancre la plus proche. L'appartenance à un noyau est numérique, pas une liaison gravitationnelle à une étoile centrale.
 
-Les quantiles extrêmes sont bornés numériquement à environ huit écarts types. La projection optique coupe les queues au-delà de six écarts types. Ces seuils ne correspondent pas à une frontière importante de densité.
+Les quantiles extrêmes sont bornés numériquement à environ huit écarts types. La projection optique utilise au moins six écarts types, avec une portée accrue si l'exposition le demande. Ces seuils ne correspondent pas à une frontière importante de densité.
 
 La recherche intersecte des sous-arbres de rangs avec la fenêtre. Le budget de travail est réparti entre les noyaux selon leur probabilité de présence. Les cellules partiellement résolues utilisent une approximation d'intersection ; les propositions hors champ sont rejetées. L'interface signale cette approximation et le nombre de sources manquantes par rapport à l'allocation souhaitée. Le plafond lumineux n'est donc pas une garantie de complétude.
 
@@ -46,7 +46,7 @@ Ce POC teste une représentation, sans démontrer qu'elle remplace fidèlement l
 2. Les ancres portent la gravité adoucie ; leurs distributions gaussiennes reconstruites n'alimentent pas à leur tour une résolution de champ exacte. La cohérence entre ces deux représentations de masse est approximative.
 3. La reconstruction est lissée à une résolution numérique finie. L'absence de coupure ne suffit pas à prouver une densité correcte. Il reste à comparer profils radiaux, distributions de vitesse, énergie et évolution des structures avec des références à résolution croissante.
 4. La découverte 4D est actuellement incomplète à travail borné. Elle demeure le principal coût lors des déplacements ou changements d'échelle. Un noyau de densité régulier ne garantit pas à lui seul un catalogue affiché sans variation d'échantillonnage.
-5. Le calcul des matrices, la découverte et la préparation de la densité utilisent encore le CPU. Le FMM et la lumière utilisent le GPU. Ce n'est pas une promesse de 60 FPS, notamment en avance rapide.
+5. Le calcul des matrices, la découverte, l'intégrale de population visible et la préparation des instances utilisent encore le CPU. Le FMM et la lumière utilisent le GPU. Ce n'est pas une promesse de 60 FPS, notamment en avance rapide.
 6. Pas de FMM de rencontres entre étoiles inférées, pas de systèmes planétaires et pas de migration des anciennes identités dans ce POC. Ces fonctions restent dans l'application principale.
 
 ## Validation
@@ -55,6 +55,7 @@ Ce POC teste une représentation, sans démontrer qu'elle remplace fidèlement l
 npm test
 npm run test:anchors
 npm run test:anchors-ui
+npm run test:diffuse
 node test-gpu-runner.cjs --local --hardware
 ```
 
@@ -62,6 +63,22 @@ Les tests Node couvrent les identités jusqu'à 10²⁴, l'éviction du cache, l
 
 Premières mesures sur cette machine : écart RMS du champ d'environ 1,6 % sur les cibles testées ; dérive relative du moment cinétique d'environ 0,003 % à 26,5 My. Dans la région historique, le rapport de densité entre deux points à ±50 pc vaut environ 1,03 dans ce POC. Ce ne sont pas des comparaisons de deux univers identiques.
 
-L'optimisation de la découverte a réduit un essai d'environ 533 à 80 ms ; une recherche réutilisée prend environ 1 ms. Le mode FMM absolu à une passe réduit l'essai d'interface d'avance à 26,5 My à environ 3,6 secondes. L'essai de suivi à 1 an/s mesurait environ 23 FPS. Ces mesures sont indicatives, distinctes des performances de l'application principale.
+L'optimisation de la découverte a réduit un essai d'environ 533 à 80 ms ; une recherche réutilisée prend environ 1 ms. Le mode FMM absolu à une passe réduit l'essai d'interface d'avance à 26,5 My à environ 3,6 secondes. Avant le rendu diffus direct, l'essai de suivi à 1 an/s mesurait environ 23 FPS. Ces mesures sont indicatives, distinctes des performances de l'application principale.
 
-Les rapports complets restent dans `validation-results/`, ignoré par Git.
+## Projection diffuse directe sur GPU
+
+Chaque noyau est une ellipse additive. La covariance projetée reçoit uniquement le cœur gaussien de l'instrument et une approximation gaussienne de la surface d'un pixel :
+
+Σécran = S Σmatière Sᵀ + (σinstrument² + 1/12) I.
+
+Le facteur de normalisation dépend du déterminant de cette covariance : élargir le filtre ne crée pas de lumière. Le modèle de matière est inchangé par le zoom. Le terme 1/12 est la variance d'un pixel de largeur un ; il approxime l'intégration du pixel et n'est pas une intégrale rectangulaire exacte. Le diffus n'applique pas ici les ailes non gaussiennes du halo et des aigrettes, qui restent propres aux sources individuelles du moteur optique.
+
+Une première passe accumule la densité dans une texture native R16FLOAT (deux octets par pixel). Une deuxième applique l'exposition, la réponse géométrique et la fraction lumineuse non résolue, avant l'ajout des étoiles dans le même tampon HDR. Les calculs d'occupation utilisent la densité au pixel natif. Les covariances de la matière, le filtrage optique et la composition demeurent séparés. Aucune lecture GPU vers CPU n'est ajoutée à la boucle.
+
+L'ancienne méthode CPU project() est conservée comme référence de test ; l'interface du POC ne l'appelle plus. Le test d'interface remplace même cette méthode par une erreur pour vérifier l'absence de retour à cette voie.
+
+Validation : cas sous-pixel, ellipses tournées, translation sous-pixel, portrait et DPR 2. Comparaison indépendante à une quadrature 4 × 4 de la gaussienne convoluée avec le cœur instrumental. Sur les cas testés : écart de lumière intégrée inférieur à 0,05 %, erreur RMS d'image inférieure à 0,12 %. Sur le point testé d'une population figée de 10 000 ancres, aux zooms 1 à 4 : écart à la référence filtrée inférieur à 0,5 %. Le cumul en demi-précision entraîne une petite erreur numérique ; la conservation n'est pas déclarée exacte.
+
+Mesures indicatives : environ 5 ms par image pour 10 000 noyaux en 1280 × 720, intégrale de population et attente GPU incluses ; environ 60 FPS dans l'essai d'interface de suivi à 1 année/s après cette modification. La découverte de nouvelles sources reste le coût dominant lors de certains changements de cadrage. Ces résultats ne garantissent pas la même cadence à toute résolution ou à toute époque.
+
+Les rapports complets restent dans validation-results/, ignoré par Git.

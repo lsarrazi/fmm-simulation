@@ -1,0 +1,269 @@
+<!doctype html><meta charset="utf-8" /><title>
+  Direct Gaussian GPU validation
+</title>
+<pre id="output">RUNNING</pre>
+<script src="stellar-population.js"></script>
+<script src="milky-way.js"></script>
+<script src="src/observation/camera-frame.js"></script>
+<script src="stellar-light.js"></script>
+<script src="src/poc/anchor-engine.js"></script>
+<script src="src/poc/anchor-population.js"></script>
+<script src="src/poc/gaussian-diffuse-gpu.js"></script>
+<script>
+  (async () => {
+    let device, layer, target;
+    try {
+      const adapter = await navigator.gpu.requestAdapter({
+        powerPreference: "high-performance",
+      });
+      device = await adapter.requestDevice();
+      const errors = [];
+      device.addEventListener("uncapturederror", (e) =>
+        errors.push(e.error.message),
+      );
+      const half = (v) => {
+        const sign = v & 32768 ? -1 : 1,
+          e = (v >> 10) & 31,
+          m = v & 1023;
+        return (
+          sign *
+          (e === 0
+            ? (2 ** -14 * m) / 1024
+            : e === 31
+              ? Infinity
+              : 2 ** (e - 15) * (1 + m / 1024))
+        );
+      };
+      async function read(texture, width, height) {
+        const channels = texture.format === "r16float" ? 1 : 4;
+        const row = Math.ceil((width * channels * 2) / 256) * 256,
+          b = device.createBuffer({
+            size: row * height,
+            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+          }),
+          e = device.createCommandEncoder();
+        e.copyTextureToBuffer({ texture }, { buffer: b, bytesPerRow: row }, [
+          width,
+          height,
+        ]);
+        device.queue.submit([e.finish()]);
+        await b.mapAsync(GPUMapMode.READ);
+        const data = new Uint16Array(b.getMappedRange()),
+          result = new Float64Array(width * height);
+        for (let y = 0; y < height; y++)
+          for (let x = 0; x < width; x++)
+            result[y * width + x] = half(data[(y * row) / 2 + x * channels]);
+        b.unmap();
+        b.destroy();
+        return result;
+      }
+      function setup(population, ctx) {
+        layer?.destroy();
+        target?.destroy();
+        target = device.createTexture({
+          size: [ctx.pixelWidth, ctx.pixelHeight],
+          format: "rgba16float",
+          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+        });
+        return GaussianDiffuseGPU.create({ device, population }).then(
+          (l) => (layer = l),
+        );
+      }
+      async function draw(population, ctx, x = 0, y = 0) {
+        const projection = population.windowProjection({
+            x,
+            y,
+            width: ctx.worldSpan,
+            aspectX: ctx.aspectX,
+            aspectY: ctx.aspectY,
+          }),
+          result = {
+            geometry: cameraGeometry(projection, { context: ctx }),
+            diffuseParameters: {
+              unrepresented: 1,
+              meanRemainder: 1,
+              detailWeight: 0,
+              beam: 4 * Math.PI * ctx.sigmaPixels ** 2,
+            },
+          },
+          encoder = device.createCommandEncoder();
+        layer.encode(encoder, { target, projection, context: ctx, result });
+        device.queue.submit([encoder.finish()]);
+        return read(layer.density, ctx.pixelWidth, ctx.pixelHeight);
+      }
+      const nodes = [-0.8611363116, -0.3399810436, 0.3399810436, 0.8611363116],
+        weights = [0.3478548451, 0.6521451549, 0.6521451549, 0.3478548451],
+        reports = [];
+      for (const [R, phase, dpr, portrait] of [
+        [0.02, 0, 1, false],
+        [0.02, 0.47, 1, false],
+        [0.3, 0.31, 1, false],
+        [1, 0.17, 1, false],
+        [3, 0.4, 1, false],
+        [12, 0.25, 1, false],
+        [0.3, 0.47, 2, true],
+      ]) {
+        const ctx = renderContext(
+            viewportGeometry(portrait ? 96 : 128, portrait ? 128 : 96, {
+              pixelRatio: dpr,
+            }),
+            { worldShortSpan: 4, sigmaCss: 1 },
+          ),
+          scale = ctx.pixelSpan / ctx.worldSpan,
+          h = R / scale,
+          theta = 0.63,
+          anchor = {
+            x: phase / scale,
+            y: -0.21 / scale,
+            A: new Float64Array([
+              h * Math.cos(theta),
+              -0.35 * h * Math.sin(theta),
+              0,
+              0,
+              h * Math.sin(theta),
+              0.35 * h * Math.cos(theta),
+              0,
+              0,
+            ]),
+          },
+          pop = new AnchorPopulation({
+            seed: 417,
+            count: 1,
+            time: 0,
+            anchors: [anchor],
+          }),
+          q = covariance(anchor);
+        await setup(pop, ctx);
+        const values = await draw(pop, ctx),
+          sigmaWorld = ctx.sigmaPixels / scale,
+          xx = q.xx + sigmaWorld ** 2,
+          xy = q.xy,
+          yy = q.yy + sigmaWorld ** 2,
+          det = xx * yy - xy * xy;
+        let sum = 0,
+          error = 0,
+          norm = 0;
+        for (let y = 0; y < ctx.pixelHeight; y++)
+          for (let x = 0; x < ctx.pixelWidth; x++) {
+            let ref = 0;
+            for (let a = 0; a < 4; a++)
+              for (let b = 0; b < 4; b++) {
+                const dx =
+                    (x + 0.5 + 0.5 * nodes[a] - ctx.pixelWidth / 2) / scale -
+                    anchor.x,
+                  dy =
+                    -(y + 0.5 + 0.5 * nodes[b] - ctx.pixelHeight / 2) / scale -
+                    anchor.y;
+                ref +=
+                  (((weights[a] * weights[b]) / 4) *
+                    Math.exp(
+                      (-0.5 *
+                        (yy * dx * dx - 2 * xy * dx * dy + xx * dy * dy)) /
+                        det,
+                    )) /
+                  (2 * Math.PI * Math.sqrt(det));
+              }
+            const value = values[y * ctx.pixelWidth + x];
+            sum += value;
+            error += (value - ref) ** 2;
+            norm += ref * ref;
+          }
+        const mass = sum / scale ** 2,
+          rms = Math.sqrt(error / norm);
+        if (Math.abs(mass - 1) > 0.002 || rms > 0.012)
+          throw Error(
+            "Filtered Gaussian mismatch " +
+              JSON.stringify({ R, phase, dpr, mass, rms }),
+          );
+        reports.push({ R, phase, dpr, portrait, mass, rms });
+      }
+      // Freeze the real 10k population. Change only zoom, and compare at the exact
+      // physical pixel centres against an independent filtered density evaluation.
+      const model = new AnchorEngine({ count: 10000 }),
+        pop = new AnchorPopulation(model),
+        zoomReports = [];
+      let referenceExposure = null;
+      for (const zoom of [1, 1.05, 1.1, 1.2, 1.5, 2, 3, 4]) {
+        const ctx = renderContext(viewportGeometry(1024, 768), {
+            worldShortSpan: 4 / zoom,
+            sigmaCss: 1,
+          }),
+          scale = ctx.pixelSpan / ctx.worldSpan;
+        await setup(pop, ctx);
+        const values = await draw(pop, ctx),
+          x = Math.floor(ctx.pixelWidth / 2 + 0.35 * scale),
+          y = Math.floor(ctx.pixelHeight / 2 - 0.1 * scale),
+          wx = (x + 0.5 - ctx.pixelWidth / 2) / scale,
+          wy = -(y + 0.5 - ctx.pixelHeight / 2) / scale,
+          f = (ctx.sigmaPixels ** 2 + 1 / 12) / scale ** 2;
+        let ref = 0;
+        for (const { anchor: p, covariance: q, mass } of pop.gaussians()) {
+          const xx = q.xx + f,
+            yy = q.yy + f,
+            xy = q.xy,
+            det = xx * yy - xy * xy,
+            dx = wx - p.x,
+            dy = wy - p.y;
+          ref +=
+            (mass *
+              Math.exp(
+                (-0.5 * (yy * dx * dx - 2 * xy * dx * dy + xx * dy * dy)) / det,
+              )) /
+            (2 * Math.PI * Math.sqrt(det));
+        }
+        const actual = values[y * ctx.pixelWidth + x],
+          error = actual / ref - 1;
+        if (Math.abs(error) > 0.02)
+          throw Error(
+            "Zoom-dependent density error " +
+              JSON.stringify({ zoom, actual, ref, error }),
+          );
+        zoomReports.push({ zoom, actual, reference: ref, error });
+      }
+      // Benchmark normal rendering without any readback.
+      const ctx = renderContext(viewportGeometry(1280, 720), {
+        worldShortSpan: 4,
+      });
+      await setup(pop, ctx);
+      const times = [];
+      for (let k = 0; k < 7; k++) {
+        const start = performance.now(),
+          projection = pop.windowProjection({
+            width: ctx.worldSpan,
+            aspectX: ctx.aspectX,
+            aspectY: ctx.aspectY,
+          }),
+          encoder = device.createCommandEncoder(),
+          result = {
+            geometry: cameraGeometry(projection, { context: ctx }),
+            diffuseParameters: {
+              unrepresented: 1,
+              meanRemainder: 1,
+              detailWeight: 0,
+              beam: 4 * Math.PI,
+            },
+          };
+        layer.encode(encoder, { target, projection, context: ctx, result });
+        device.queue.submit([encoder.finish()]);
+        await device.queue.onSubmittedWorkDone();
+        times.push(performance.now() - start);
+      }
+      if (errors.length) throw Error(errors.join(";"));
+      output.textContent =
+        "PASS " +
+        JSON.stringify({
+          reports,
+          zoomReports,
+          median1280x720Ms: times.slice(2).sort((a, b) => a - b)[2],
+          work: layer.work,
+          noRuntimeReadback: true,
+        });
+    } catch (e) {
+      output.textContent = "FAIL " + e.stack;
+    }
+    await fetch("/result", { method: "POST", body: output.textContent });
+    layer?.destroy();
+    target?.destroy();
+    device?.destroy();
+  })();
+</script>

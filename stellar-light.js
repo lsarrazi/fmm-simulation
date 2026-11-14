@@ -71,7 +71,7 @@ function plan(projection,points,{population,size=600,sigma=1,complete=false,gain
  const diffuseImage=new Float64Array(projection.image.length),beam=4*Math.PI*sigma*sigma,pixelArea=(size/projection.resolution)**2,mass=projection.mass??projection.image.reduce((a,b)=>a+b,0),observedMass=projection.viewMass??mass,unrepresented=Math.max(0,1-stellarSourceCount/Math.max(N*observedMass,1e-300));let remaining=0,coverage=0;
  const tail=Population.luminosityTailMoments(leastVisible),represented=Math.min(1,stellarSourceCount/Math.max(N*observedMass*tail.probability,1e-300)),meanRemainder=Math.max(0,1-detailWeight*represented*tail.luminosity/Population.meanVisibleLuminosity);
  for(let i=0;i<diffuseImage.length;i++){const cellMass=projection.image[i],weight=Math.max(1-detailWeight,diffuseCrowdingWeight(N*cellMass*unrepresented*beam/pixelArea));coverage+=cellMass*weight;diffuseImage[i]=complete?(1-detailWeight)*cellMass:weight*cellMass*meanRemainder;remaining+=diffuseImage[i];}
- return{drawn,sources,candidates,diffuseImage,residual:remaining/Math.max(mass,1e-300),diffuseCoverage:coverage/Math.max(mass,1e-300),estimatedPopulation:N*observedMass,luminosity,complete,geometry,fluxGain,occupancy:occupancy(projection,population,size,sigma,context)};
+ return{drawn,sources,candidates,diffuseImage,diffuseParameters:{unrepresented,meanRemainder,detailWeight,beam},residual:remaining/Math.max(mass,1e-300),diffuseCoverage:coverage/Math.max(mass,1e-300),estimatedPopulation:N*observedMass,luminosity,complete,geometry,fluxGain,occupancy:occupancy(projection,population,size,sigma,context)};
 }
 // Tail support follows the exposed image signal, never the world-coordinate
 // magnitude. Bounds are rounded into cacheable levels; omitted light stays below

@@ -79,6 +79,24 @@
     ) /
     (2 * Math.PI * Math.sqrt(q.det));
   function rectangleProbability(p, q, view) {
+    const rx = 8 * Math.sqrt(q.xx),
+      ry = 8 * Math.sqrt(q.yy);
+    // Tail probability beyond this bound is below floating-point observation
+    // precision. Most distant/full-view clouds need no quadrature at all.
+    if (
+      p.x + rx < view.l ||
+      p.x - rx > view.r ||
+      p.y + ry < view.b ||
+      p.y - ry > view.t
+    )
+      return 0;
+    if (
+      p.x - rx >= view.l &&
+      p.x + rx <= view.r &&
+      p.y - ry >= view.b &&
+      p.y + ry <= view.t
+    )
+      return 1;
     const sx = Math.sqrt(q.xx),
       l = Math.max(-8, (view.l - p.x) / sx),
       r = Math.min(8, (view.r - p.x) / sx);
@@ -239,6 +257,51 @@
             y,
           );
       return value;
+    }
+    gaussians() {
+      if (this.gaussianEpoch !== this.engine.time) {
+        this.gaussianEpoch = this.engine.time;
+        this.gaussianCache = this.engine.anchors.map((anchor, i) => ({
+          anchor,
+          covariance: covariance(anchor),
+          mass: Number(this.counts[i]) / Number(this.population),
+        }));
+      }
+      return this.gaussianCache;
+    }
+    windowProjection({
+      x = 0,
+      y = 0,
+      width = 4,
+      aspectX = 1,
+      aspectY = 1,
+    } = {}) {
+      const view = {
+        l: x - (width * aspectX) / 2,
+        r: x + (width * aspectX) / 2,
+        b: y - (width * aspectY) / 2,
+        t: y + (width * aspectY) / 2,
+      };
+      let mass = 0;
+      for (const { anchor, covariance: q, mass: weight } of this.gaussians())
+        mass += weight * rectangleProbability(anchor, q, view);
+      // Geometry/observation metadata only. This placeholder is never displayed:
+      // the direct GPU layer evaluates the actual spatial distribution.
+      return {
+        image: new Float64Array(1),
+        resolution: 1,
+        width,
+        pixel: width,
+        left: x - width / 2,
+        bottom: y - width / 2,
+        centerX: x,
+        centerY: y,
+        aspectX,
+        aspectY,
+        mass,
+        viewMass: mass,
+        expected: Number(this.population) * mass,
+      };
     }
     project({
       x = 0,

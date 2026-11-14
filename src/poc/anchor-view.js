@@ -7,6 +7,7 @@
   let engine,
     population,
     renderer,
+    diffuse,
     ready = false,
     busy = false,
     running = false,
@@ -68,9 +69,10 @@
     target = null;
     $("play").disabled = $("advance").disabled = true;
     $("status").textContent = "Création des ancres et de la FMM GPU…";
+    diffuse?.destroy();
     renderer?.destroy();
     engine?.destroy();
-    renderer = engine = null;
+    diffuse = renderer = engine = null;
     observationMemo = null;
     selected = tracked = null;
     points = [];
@@ -89,6 +91,10 @@
       population = new AnchorPopulation(engine);
       renderer = await GPUStellarLightRenderer.create({
         device: engine.device,
+      });
+      diffuse = await GaussianDiffuseGPU.create({
+        device: engine.device,
+        population,
       });
       ready = true;
       dirty = true;
@@ -117,7 +123,7 @@
         aspectX: context.aspectX,
         aspectY: context.aspectY,
       },
-      projection = population.project({ ...view, resolution: 96 });
+      projection = population.windowProjection(view);
     projection.cameraWidth = context.worldShortSpan;
     projection.zoom = camera.zoom;
     projection.fovDegrees = 50;
@@ -227,6 +233,7 @@
       lengthPc: 10000,
       opticalShape: DEFAULT_OPTICAL_SHAPE,
       stellarFade: DEFAULT_STELLAR_FADE,
+      diffuseLayer: diffuse,
     });
     renderer.present(canvas, {
       width: context.pixelWidth,
@@ -241,6 +248,7 @@
     canvas.dataset.visited = String(lastSample.visited);
     canvas.dataset.approximate = String(lastSample.approximate);
     canvas.dataset.backend = "GPU FMM anchors";
+    canvas.dataset.diffuseBackend = diffuse.work.backend;
     $("time").textContent = number(engine.time) + " My";
     $("hud").textContent =
       number(engine.count) +
@@ -463,6 +471,7 @@
     dirty = true;
   }).observe($("viewport"));
   window.addEventListener("beforeunload", () => {
+    diffuse?.destroy();
     renderer?.destroy();
     engine?.destroy();
   });

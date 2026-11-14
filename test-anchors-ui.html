@@ -26,6 +26,12 @@
         $ = (id) => d.getElementById(id),
         scene = $("scene");
       await wait(() => scene.dataset.time === "0");
+      if (scene.dataset.diffuseBackend !== "direct Gaussian GPU")
+        throw Error("Coarse diffuse path still active");
+      w.AnchorPopulation.prototype.project = () => {
+        throw Error("POC must not rasterize a coarse CPU density grid");
+      };
+      await fetch("/preview-calibration", { method: "POST" });
       $("densityOnly").checked = true;
       $("densityOnly").dispatchEvent(new Event("input"));
       $("targetTime").value = "26.5";
