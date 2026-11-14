@@ -1,0 +1,19 @@
+{
+  "name": "fmm-simulation",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Deterministic multiscale galaxy and stellar-system simulation",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node scripts/serve.cjs",
+    "test": "node scripts/test.cjs",
+    "test:gpu": "node test-gpu-runner.cjs --navigation --hardware",
+    "format": "prettier --write comparison-view.js observation-tools.js src scripts docs README.md package.json .github",
+    "format:check": "prettier --check comparison-view.js observation-tools.js src scripts docs README.md package.json .github"
+  },
+  "devDependencies": {
+    "prettier": "3.10.1"
+  }
+}

@@ -1,341 +1,3235 @@
 (() => {
- 'use strict';
- const $=id=>document.getElementById(id),clock=new SimulationClock(),camera={x:0,y:0,zoom:1,fovDegrees:50};
- const solar=new PlanetarySystems.Manager(),solarCamera={x:0,y:0},trackingPan={x:0,y:0},solarTrackingPan={x:0,y:0};let solarLagNs=0n,solarSelected=null,solarTracked=null,solarSavedMask=true,solarGuideIds=new Set(),solarGPUguides=[];
- const lightRenderer=new StellarLightRenderer(600);let projection=null,lightStats=null,lightGain=1;
- const zoomMotion=new SmoothZoom(),displayFPS=new FrameRateMeter(),renderFPS=new FrameRateMeter();let sceneCanvas=document.createElement('canvas'),gpuLightRenderer=null,renderCamera=null,observationCamera=null,renderFrameContext=null,presentedView=null,presentedContext=null,renderedPoints=null,renderProjection=null,observationSolarScene=null,renderSolarScene=null,observationRevision=0,paintedRevision=-1,lastHud=0,physicsBusy=false,displayAnchor=null;
- let speedMode='rate',rateContext='galaxy',rateCeiling=unitNs('Gy');let referenceDraft=false,referenceError='',referenceLastId='',referenceBusy=false,pendingReference=null,referenceSequence=0,referenceDraftVersion=0;
- const defaultLightCalibration=Object.freeze({budget:8192,onset:160}),lightCalibration={...defaultLightCalibration};
- const defaultStellarOptics=Object.freeze({sigma:1,glare:.65,angle:15,profile:'starburst'}),defaultExposure=-4.5;let stellarOptics={...defaultStellarOptics,shape:{...DEFAULT_OPTICAL_SHAPE},fade:{...DEFAULT_STELLAR_FADE}},effectiveLightBudget=lightCalibration.budget,adaptiveDensityRatio=0;
- const opticalFields=['haloExtent','spikeLength','spikeMin','spikeMax'],fadeFields=['fadeStart','fadeEnd','fadeCurve'];
- function applyStellarOptics(){try{const shape=readOpticalShape(Object.fromEntries(opticalFields.map(id=>[id,$(id).value]))),fade=readStellarFade({enabled:$('stellarFadeEnabled').checked,start:$('fadeStart').value,end:$('fadeEnd').value,curve:$('fadeCurve').value}),sigma=Number($('psfWidth').value),glare=Number($('glareStrength').value),angle=Number($('spikeAngle').value);if(!Number.isFinite(sigma)||sigma<.5||sigma>3)throw Error('La largeur du cœur doit être comprise entre 0,5 et 3 px.');if(!Number.isFinite(glare)||glare<0||glare>.8||!Number.isFinite(angle))throw Error('Réglages optiques invalides.');if(gpuLightRenderer){const radius=opticalKernelSupport(sigma*screenShape().pixelRatio,1e20,shape).radius,side=2*radius+1,limits=gpuLightRenderer.device.limits;if(side>limits.maxTextureDimension2D||side*side*8>limits.maxStorageBufferBindingSize)throw Error('Ce profil dépasse la capacité graphique. Réduire sa portée ou sa largeur.');}stellarOptics={sigma,glare,angle,profile:$('opticalProfile').value,shape,fade};for(const id of [...opticalFields,...fadeFields])$(id).setAttribute('aria-invalid','false');$('stellarOpticsStatus').textContent='Appliqué · cœur '+sigma+' px · halo '+shape.haloExtent+' × · aigrettes '+shape.spikeLength+' ×';$('stellarOpticsStatus').setAttribute('data-error','false');objectExposure=false;observationKey='';dirty=true;return true;}catch(e){$('stellarOpticsStatus').textContent=e.message;$('stellarOpticsStatus').setAttribute('data-error','true');if(e.field)$(e.field).setAttribute('aria-invalid','true');return false;}}
- const lightSourceLimit=()=>gpuLightRenderer?.sourceLimit??Number.MAX_SAFE_INTEGER;
- function updateAdaptiveControls(){const enabled=$('adaptiveSources').checked;for(const id of ['starBudget','budgetHalve','budgetDouble'])if($(id).disabled!==enabled)$(id).disabled=enabled;if(!enabled)effectiveLightBudget=lightCalibration.budget;const status=enabled?'Adaptatif · plafond actif '+effectiveLightBudget.toLocaleString('fr-FR')+' · densité '+adaptiveDensityRatio.toFixed(2)+' × la référence':'Manuel · plafond '+lightCalibration.budget.toLocaleString('fr-FR');if($('adaptiveSourcesStatus').textContent!==status)$('adaptiveSourcesStatus').textContent=status;const label=enabled?'Plafond manuel conservé':'Plafond de sources lumineuses';if($('starBudgetLabel').textContent!==label)$('starBudgetLabel').textContent=label;const reference=calibration?'Référence : densité moyenne au rayon solaire.':'Référence : densité moyenne du domaine.';if($('adaptiveReference').textContent!==reference)$('adaptiveReference').textContent=reference;}
-
- function budgetForProjection(field){const widthPc=field.width*lengthPc(),density=field.expected/Math.max(widthPc*widthPc*(field.aspectX??1)*(field.aspectY??1),1e-300),reference=calibration?.surfaceSolar?calibration.surfaceSolar*Number(materials.population)/Number(calibration.stars):Number(materials.population)/(2*grid.extent*lengthPc())**2;adaptiveDensityRatio=reference>0?density/reference:0;effectiveLightBudget=$('adaptiveSources').checked?adaptiveStellarBudget(density,reference,lightSourceLimit()):lightCalibration.budget;updateAdaptiveControls();return effectiveLightBudget;}
- function lightCalibrationLabel(){return ($('adaptiveSources').checked?'adaptatif · 4 096–16 384 sources':lightCalibration.budget.toLocaleString('fr-FR')+' sources')+' · apparition ×'+lightCalibration.onset;}
- function showLightCalibration(error=null,suspended=false){$('lightCalibrationStatus').textContent=error?error.message+(suspended?' Réduire le plafond pour afficher les sources.':' Réglage conservé : '+lightCalibrationLabel()):'Appliqué : '+lightCalibrationLabel();$('lightCalibrationStatus').setAttribute('data-error',String(!!error));for(const [id,key]of [['starBudget','budget'],['starOnset','onset']])$(id).setAttribute('aria-invalid',String(error?.field===key));}
- function applyLightCalibration(){try{const next=readLightCalibration($('starBudget').value,$('starOnset').value,lightSourceLimit()),changed=next.budget!==lightCalibration.budget||next.onset!==lightCalibration.onset;Object.assign(lightCalibration,next);$('starBudget').value=String(next.budget);$('starOnset').value=String(next.onset);showLightCalibration();updateAdaptiveControls();if(changed){observationKey='';dirty=true;}return true;}catch(error){showLightCalibration(error);return false;}}
- function lightBackendChanged(){try{readLightCalibration(lightCalibration.budget,lightCalibration.onset,lightSourceLimit());showLightCalibration();}catch(error){showLightCalibration(error,true);}}
-
- const rateUnit=()=>speedMode==='rate'?$('speedUnit').value:['Ty','Gy','My','ky','y','mo','w','d','h','min','s','ms','us','ns'].find(u=>clock.rateNumber()>=Number(unitNs(u)))||'ns';
- let grid,materials,localDynamics,running=false,manual=false,loading=false,generation=0,revision=0;
- let physics={gravity:.48,softening:.042,haloV2:0,extent:1.5,vmax:2},calibration=null;
- const parameters=()=>({...physics,softening:Number($('softening').value)});
- const resolveMatter=(id,offset=galacticOffset())=>localDynamics?localDynamics.resolve(materials,id,offset):materials.resolve(id,offset);
- function showTab(name){$('simulationPane').hidden=name!=='simulation';$('objectPane').hidden=name!=='object';$('advancedPane').hidden=name!=='advanced';$('advancedTab').setAttribute('aria-selected',String(name==='advanced'));$('simulationTab').setAttribute('aria-selected',String(name==='simulation'));$('objectTab').setAttribute('aria-selected',String(name==='object'));}
- async function prepareLocal(){if(!grid||!materials)return;const token=generation,local=localDynamics;await local.prepare(materials,grid,{...camera,zoom:2*grid.extent/viewContext(camera,false).worldSpan},{...parameters(),totalMass:calibration?.massMsun||0,lengthPc:lengthPc(),guard:Number($('localGuard').value),enabled:$('localDynamics').checked&&!!calibration&&$('population').value==='11'});if(token===generation)clock.minimumStep=Math.min(MIN_MODEL_STEP,Math.max(1e-12,local.stepLimit));}
-
- let scale=1,initialL=0,lastCost=0,lastWall=performance.now(),lastObserveCost=0,lastRenderCost=0,lastSteps=0,lastAdvanced=0,detailWeight=0;
- let stellarPoints=[],stellarProjection=null,stellarSampleInfo=null,stellarDetail=0;let diagnostics,points=[],sampleInfo=null,phaseCache=null,phaseKey='',observationKey='';
- let lastObservation=0,rateStamp=performance.now(),rateAnchor=0n,actualRate=0,dirty=true,selected=null,trackedId=null,drag=null,rateError='',photometricFilter=null,objectExposure=false,lastSampleZoom=0,retentionMode='none',retainedCount=0;
- const angular=b=>b.reduce((s,p)=>s+p.mass*(p.x*p.vy-p.y*p.vx),0);
- const number=x=>Math.abs(x)>=.001&&Math.abs(x)<1e6?x.toPrecision(4):x.toExponential(3);
- const lengthPc=()=>calibration?calibration.lengthKpc*1000:10000;
- function galacticOffset(){return clock.fineOffset()+Number(solarLagNs)/Number(MODEL_NS);}
- function solarFullWidthAU(){return 2*grid.extent*lengthPc()/PlanetarySystems.AU_PC;}
- function solarWidthAU(){return solarFullWidthAU()/camera.zoom;}
- function viewContext(view=camera,local=!!solar.active,viewport=screenShape()){return renderContext(viewport,{worldShortSpan:local?solarWidthAU():2*grid.extent/view.zoom,fovDegrees:camera.fovDegrees,sigmaCss:stellarOptics.sigma,units:local?'AU':'model',lengthPc:local?PlanetarySystems.AU_PC:lengthPc()});}
- function imageContext(field=projection){const local=observationCamera?.space==='system';return renderContext(screenShape(),{worldShortSpan:field.cameraWidth??field.width,worldSpan:field.width,fovDegrees:field.fovDegrees??camera.fovDegrees,sigmaCss:stellarOptics.sigma,units:local?'AU':'model',lengthPc:local?PlanetarySystems.AU_PC:lengthPc()});}
- function inCurrentGalaxyView(point){const c=viewContext(camera,false);return Math.abs(point.x-camera.x)<=c.worldWidth/2&&Math.abs(point.y-camera.y)<=c.worldHeight/2;}
- function solarOffsetYear(){return clock.fineOffset()*1e6;}
- function leaveSolar(){if(!solar.active)return;const host=resolveMatter(solar.active.system.starId);trackingPan.x=solarCamera.x*PlanetarySystems.AU_PC/lengthPc();trackingPan.y=solarCamera.y*PlanetarySystems.AU_PC/lengthPc();camera.x=host.x+trackingPan.x;camera.y=host.y+trackingPan.y;Object.assign(solarTrackingPan,{x:0,y:0});solar.deactivate();solarSelected=solarTracked=null;$('systemOverlay').setAttribute('hidden','');$('systemBodyCard').hidden=true;$('systemMask').checked=solarSavedMask;clock.minimumStep=MIN_MODEL_STEP;observationKey='';dirty=true;cameraControls();}
- async function prepareSolar(){
-  if(!$('planetaryEnabled').checked||!grid.isGPU||!gpuLightRenderer){leaveSolar();return false;}
-  const width=solarWidthAU();if(width>24000||(solar.active&&Math.hypot(solarCamera.x,solarCamera.y)>24000)){leaveSolar();return false;}
-  let id=solar.active?.system.starId||trackedId||selected;
-  if(!id&&width<=12000){const candidate=points.filter(p=>String(p.id).split('/').length===3).sort((a,b)=>Math.hypot(a.x-camera.x,a.y-camera.y)-Math.hypot(b.x-camera.x,b.y-camera.y))[0];id=candidate?.id;}
-  if(!id||(!solar.active&&width>12000))return false;
-  const host=resolveMatter(id);if(!solar.active&&!inCurrentGalaxyView(host))return false;
-  const entering=!solar.active,inspection=entering&&objectExposure&&width<40*stellarProperties(id).radius*StellarPopulation.solarRadiusPc/PlanetarySystems.AU_PC;
-  // Keep the displayed camera untouched while GPU resources are prepared.
-  setContextSpeed('system');const token=generation,r=await solar.activate(id,clock.integrated,($('systemAsteroids').value==='auto'?null:Number($('systemAsteroids').value)),solarSelected);if(token!==generation||!r)return false;
-  if(entering){
-   // Commit from the live view: zoom/pan can change during async activation.
-   const currentHost=resolveMatter(id);
-   if(!$('planetaryEnabled').checked||solarWidthAU()>12000||!inCurrentGalaxyView(currentHost)){solar.deactivate();return false;}
-   solarCamera.x=(camera.x-currentHost.x)*lengthPc()/PlanetarySystems.AU_PC;solarCamera.y=(camera.y-currentHost.y)*lengthPc()/PlanetarySystems.AU_PC;Object.assign(solarTrackingPan,solarCamera);Object.assign(trackingPan,{x:0,y:0});
-   solarSavedMask=$('systemMask').checked;if(inspection)$('systemMask').checked=false;solarTracked=id;selected=trackedId=id;camera.x=currentHost.x;camera.y=currentHost.y;localDynamics.deactivate(materials.time,'FMM locale active · système planétaire.');cameraControls();}
-  clock.minimumStep=Math.max(1e-15,Math.min(MIN_MODEL_STEP,r.stepYear/1e6));updateSolarTracking();if(inspection){observeSolar();exposeSolarBody(id);}return true;
- }
- function updateSolarTracking(){if(!solar.active||!solarTracked||physicsBusy)return;const p=solar.resolve(solarTracked,solarOffsetYear());const x=p.x+solarTrackingPan.x,y=p.y+solarTrackingPan.y;if(solarCamera.x!==x||solarCamera.y!==y){solarCamera.x=x;solarCamera.y=y;dirty=true;}updateSolarCard();}
- function solarZoomLimit(value){let z=Math.max(1,Math.min(1e21,value));if(!Number.isFinite(z))return camera.zoom;const id=solarTracked||solarSelected||solar.active.system.starId,p=solar.resolve(id,solarOffsetYear()),R=p.radiusKm/PlanetarySystems.AU_KM*1.05,lateral=Math.hypot(p.x-solarCamera.x,p.y-solarCamera.y);if(lateral<R)z=Math.min(z,solarFullWidthAU()/(2*Math.tan(camera.fovDegrees*Math.PI/360)*Math.sqrt(R*R-lateral*lateral)));return z;}
- function stellarAppearance(point,primaryId,widthAU){if(!$('planetaryEnabled').checked||!grid?.isGPU||point.id!==primaryId)return point;const t=Math.max(0,Math.min(1,Math.log(48000/widthAU)/Math.log(2))),blend=t*t*(3-2*t),base=point.photometry||stellarProperties(point.id),mask=$('systemMask').checked?1-blend:1;return{...point,photometry:{...base,disc:false,glareScale:1,luminosity:base.luminosity*mask,visibleLuminosity:base.visibleLuminosity*mask}};}
- function starInSolarFrame(point,host){const unit=lengthPc()/PlanetarySystems.AU_PC;return{...stellarAppearance(point,host.id,solarWidthAU()),x:(point.x-host.x)*unit,y:(point.y-host.y)*unit,stellarNeighbor:true};}
- function solarScenePoint(id){if(id===solar.active.system.starId||id.startsWith(solar.active.system.prefix+'/'))return solarLightPoint(solar.resolve(id,solarOffsetYear()));return starInSolarFrame(resolveMatter(id),resolveMatter(solar.active.system.starId));}
- function solarLightPoint(p){
-  const s=solar.active.system;if(p.id===s.starId)return stellarAppearance({...p,photometry:s.host},s.starId,solarWidthAU());const h=solarWidthAU()/(2*Math.tan(camera.fovDegrees*Math.PI/360)),r=Math.max(p.radiusKm/PlanetarySystems.AU_KM,Math.hypot(p.x,p.y)),cameraDistance=Math.hypot(solarCamera.x-p.x,solarCamera.y-p.y,h),cos=Math.max(-1,Math.min(1,(-p.x*(solarCamera.x-p.x)-p.y*(solarCamera.y-p.y))/(r*cameraDistance))),alpha=Math.acos(cos),phase=(Math.sin(alpha)+(Math.PI-alpha)*Math.cos(alpha))/Math.PI,reflection=p.albedo*(p.radiusKm/PlanetarySystems.AU_KM/r)**2*Math.max(0,phase);
-  return{...p,photometry:{disc:true,isSystemBody:true,proximityVisibility:true,radius:p.radiusKm/(StellarPopulation.solarRadiusM/1000),luminosity:s.host.luminosity*reflection,visibleLuminosity:s.host.visibleLuminosity*reflection,color:p.color.map((c,i)=>c*s.host.color[i]),lightAngle:Math.atan2(p.y,-p.x),lightCos:cos}};
- }
- function observeSolar(force=false){const now=performance.now(),host=resolveMatter(solar.active.system.starId),unit=PlanetarySystems.AU_PC/lengthPc(),view={...camera,x:host.x+solarCamera.x*unit,y:host.y+solarCamera.y*unit},key=stellarKey(view,host.id);if(!stellarProjection||(key!==observationKey&&(force||now-lastObservation>=33)))observeStellar(view,host.id,key,now);const ctx=viewContext(),width=ctx.worldSpan,base=stellarProjection;projection={...base,width,cameraWidth:ctx.worldShortSpan,fovDegrees:camera.fovDegrees,pixel:width/base.resolution,left:solarCamera.x-width/2,bottom:solarCamera.y-width/2,centerX:solarCamera.x,centerY:solarCamera.y,zoom:camera.zoom};const background=stellarPoints.filter(p=>p.id!==host.id).map(p=>starInSolarFrame(resolveMatter(p.id),host));const entries=solar.points(solarOffsetYear());observationSolarScene={hostId:host.id,entries};if(solarSelected&&!solar.active.byId.has(solarSelected))observationSolarScene.extra=solar.resolve(solarSelected,solarOffsetYear());points=[...background,...entries.filter(p=>!$('systemMask').checked||p.id!==host.id).map(solarLightPoint)];sampleInfo=stellarSampleInfo;detailWeight=stellarDetail;observationCamera=viewFrame(projection);observationRevision++;dirty=true;}
- function exposeSolarBody(id){if(!solar.active)return;observeSolar();const p=solarScenePoint(id),source=lightPlan(projection,[p],{population:materials.population,gain:lightGain,lengthPc:PlanetarySystems.AU_PC,normalizationLengthPc:lengthPc(),fovDegrees:camera.fovDegrees,context:imageContext()}).candidates[0];if(source&&source.peak>0)$('exposure').value=String(Math.max(-80,Math.min(48,Math.log2(.4/source.peak))));objectExposure=true;dirty=true;}
- function inspectSolarBody(id){Object.assign(solarTrackingPan,{x:0,y:0});const p=solar.resolve(id,solarOffsetYear());solarTracked=id;solarSelected=id===solar.active.system.starId?null:id;if(id===solar.active.system.starId)$('systemMask').checked=false;updateSolarTracking();changeZoom(solarFullWidthAU()/(12*p.radiusKm/PlanetarySystems.AU_KM));exposeSolarBody(id);showTab('object');}
- function solarOverview(){if(!solar.active)return;Object.assign(solarTrackingPan,{x:0,y:0});solarTracked=solar.active.system.starId;solarCamera.x=solarCamera.y=0;changeZoom(solarFullWidthAU()/(2.8*solar.active.system.extent));dirty=true;}
- function visitSelectedSystem(){if(solar.active&&selected&&selected!==solar.active.system.starId)leaveSolar();Object.assign(trackingPan,{x:0,y:0});Object.assign(solarTrackingPan,{x:0,y:0});const p=selected?resolveMatter(selected):points.find(p=>String(p.id).split('/').length===3)||materials.sample({...camera,budget:1,offset:galacticOffset()}).points[0];if(!p)return;selected=trackedId=p.id;camera.x=p.x;camera.y=p.y;const s=PlanetarySystems.describe(p.id);changeZoom(solarFullWidthAU()/(2.8*s.extent));showTab('object');observationKey='';dirty=true;}
- function pickSolar(target){const width=presentedView?.width??viewContext().worldSpan,size=presentedContext?.cssSpan??screenShape().cssSpan,selectable=new Set((lightStats?.sources||[]).map(p=>p.id));if($('systemGuides').checked)for(const id of solarGuideIds)selectable.add(id);if(solarSelected)selectable.add(solarSelected);let best=Infinity,choice=null;for(const p of [...(renderedPoints||[]),...(renderSolarScene?.extra?[renderSolarScene.extra]:[])]){if(!selectable.has(p.id))continue;const d=Math.hypot(p.x-target.x,p.y-target.y)/width*size,r=Math.max(10,(p.radiusKm||0)/PlanetarySystems.AU_KM/width*size);if(d<=r&&d<best){best=d;choice=p;}}if(choice){if(choice.stellarNeighbor){selected=choice.id;solarSelected=null;}else solarSelected=choice.id===solar.active.system.starId?null:choice.id;showTab('object');updateSolarCard();updateStarCard();dirty=true;}return choice;}
- function updateSolarCard(){const card=$('systemBodyCard');card.hidden=!solar.active||!solarSelected;if(card.hidden)return;const p=solar.resolve(solarSelected,solarOffsetYear()),anchor=solarTracked?solar.resolve(solarTracked,solarOffsetYear()):null;card.setAttribute('data-id',p.id);$('starCard').hidden=true;$('starHint').hidden=true;$('systemBodyName').textContent=p.name;if(document.activeElement!==$('materialId'))$('materialId').value=p.id;$('systemBodyKind').textContent=p.kind;$('systemBodyId').value=p.id;$('systemBodyMass').textContent=PlanetarySystems.formatMass(p.mass);$('systemBodyRadius').textContent=number(p.radiusKm)+' km';$('systemBodyPosition').textContent='x='+p.x.toPrecision(14)+' · y='+p.y.toPrecision(14)+' UA';$('systemBodyPosition').setAttribute('data-x',String(p.x));$('systemBodyPosition').setAttribute('data-y',String(p.y));$('systemBodyVelocity').textContent=number(Math.hypot(p.vx,p.vy)*PlanetarySystems.AU_YEAR_KMS)+' km/s';$('systemBodyRelative').textContent=anchor?'Δx='+number(p.x-anchor.x)+' · Δy='+number(p.y-anchor.y)+' UA · Δv='+number(Math.hypot(p.vx-anchor.vx,p.vy-anchor.vy)*PlanetarySystems.AU_YEAR_KMS)+' km/s':'Référentiel de l’étoile';$('trackSystemBody').textContent=solarTracked===p.id?'Arrêter le suivi':'Suivre cet objet';}
- function updateSolarStatus(){const r=solar.active;$('lookupLabel').textContent=r?'Identité du corps ou rang':'Identité de l’étoile';$('formationStatus').textContent=r?'Matière initiale : '+PlanetarySystems.formatMass(r.system.formation.initialMass)+' · condensée : '+PlanetarySystems.formatMass(r.system.formation.compactMass)+' · résiduelle : '+PlanetarySystems.formatMass(r.system.formation.residualMass)+'. '+r.system.seeds.length+' concentrations condensées.':'';$('galaxyObservation').hidden=false;$('systemObservation').hidden=!r;$('viewTitle').textContent=r?'SYSTÈME DE '+stellarName(r.system.starId):'DU CHAMP GALACTIQUE AUX ÉTOILES';if(r)$('systemHost').textContent='Revenir à '+stellarName(r.system.starId);$('visitSystem').disabled=!grid?.isGPU||!gpuLightRenderer;$('systemStatus').textContent=r?'Système de '+stellarName(r.system.starId)+' · '+r.system.seeds.filter(p=>PlanetarySystems.classifyMass(p.mass)!=='Astéroïde').length+' planètes · '+r.system.defaultCount.toLocaleString('fr-FR')+' corps matérialisés par défaut · '+r.system.smallCount.toLocaleString('fr-FR')+' identités inférées · '+r.states.length+' corps intégrés · FMM GPU '+r.lastMs.toFixed(1)+' ms.':(!grid?.isGPU||!gpuLightRenderer?'Le détail planétaire demande la physique et le rendu WebGPU.':'Zoomer vers une étoile ou utiliser « Voir le système ».');if(r){$('localCount').textContent=r.states.length+' corps du système · GPU';$('localCount').setAttribute('data-count',String(r.states.length));$('localCount').setAttribute('data-backend','GPU');$('localStatus').textContent='FMM locale active · système planétaire unique.';$('trackingStatus').textContent=solarTracked?'Référentiel suivi : '+solar.resolve(solarTracked).name:'Caméra libre dans le référentiel de l’étoile';}}
- function updateSolarOverlay(view,shape){const overlay=$('systemOverlay');const hidden=view.space!=='system'||!solar.active||renderSolarScene?.hostId!==solar.active.system.starId||!$('systemGuides').checked;overlay.toggleAttribute('hidden',hidden);solarGuideIds.clear();solarGPUguides=[];if(hidden)return;const width=view.width,cx=view.x,cy=view.y,px=x=>shape.cssWidth/2+(x-cx)/width*shape.cssSpan,py=y=>shape.cssHeight/2-(y-cy)/width*shape.cssSpan;overlay.setAttribute('viewBox','0 0 '+shape.cssWidth+' '+shape.cssHeight);overlay.style.width=shape.cssWidth+'px';overlay.style.height=shape.cssHeight+'px';let markup='';for(const p of solar.active.system.seeds){const rx=p.a/width*shape.cssSpan;if(rx>10000)continue;const x=px(-p.a*p.e*Math.cos(p.omega)),y=py(-p.a*p.e*Math.sin(p.omega));markup+='<ellipse cx="'+x+'" cy="'+y+'" rx="'+rx+'" ry="'+rx*Math.sqrt(1-p.e*p.e)+'" transform="rotate('+(-p.omega*180/Math.PI)+' '+x+' '+y+')" fill="none" stroke="#8a9aa2" stroke-opacity=".18" stroke-width=".6"/>';}
-  const featured=new Set([solar.active.system.starId,...solar.active.system.seeds.map(p=>p.id),solarSelected]),entries=renderSolarScene.entries;
-  const drawGuide=(p,worldX=p.x,worldY=p.y)=>{const isSelected=p.id===(solarSelected||selected),g=systemBodyGuide(p.radiusKm,width,{selected:isSelected,context:shape}),x=px(worldX),y=py(worldY);if(g.opacity<=.01||g.radius>shape.cssSpan||x+g.ringRadius<0||x-g.ringRadius>shape.cssWidth||y+g.ringRadius<0||y-g.ringRadius>shape.cssHeight)return;solarGuideIds.add(p.id);
-   if(!featured.has(p.id)){solarGPUguides.push({id:p.id,x,y,radius:g.ringRadius,opacity:g.opacity});return;}
-   markup+='<circle data-body-id="'+p.id+'" cx="'+x+'" cy="'+y+'" r="'+g.ringRadius+'" fill="none" stroke="'+(isSelected?'#ff5050':'#9caeb6')+'" stroke-opacity="'+g.opacity+'" stroke-width=".7" stroke-dasharray="2 2"/>';if(p.kind!=='Astéroïde'||isSelected)markup+='<text x="'+(x+g.ringRadius+4)+'" y="'+(y-5)+'" fill="#aabac1" opacity="'+g.opacity+'" font-size="8">'+p.name+'</text>';
-  };
-  // Cull by immutable radius before resolving positions; no extra orbit/body
-  // population is inferred for guides. Numerous minor-body rings use one GPU draw.
-  for(const p of entries){if(!featured.has(p.id)&&p.radiusKm/PlanetarySystems.AU_KM/width*shape.cssSpan<=.0001)continue;if(featured.has(p.id)){drawGuide(p);continue;}const x=p.x,y=p.y;if(Math.abs(x-cx)>shape.worldWidth*.51||Math.abs(y-cy)>shape.worldHeight*.51)continue;drawGuide(p,x,y);}
-  if(renderSolarScene.extra?.id===solarSelected)drawGuide(renderSolarScene.extra);
-  overlay.setAttribute('data-guide-count',String(solarGuideIds.size));overlay.setAttribute('data-gpu-guide-count',String(solarGPUguides.length));
-  overlay.innerHTML=markup;
- }
- const cameraHeight=()=>solar.active?solarWidthAU()/(2*Math.tan(camera.fovDegrees*Math.PI/360)):2*(grid?.extent||physics.extent)*lengthPc()/camera.zoom/(2*Math.tan(camera.fovDegrees*Math.PI/360));
- function cameraControls(){if(grid){$('cameraHeightLabel').textContent=solar.active?'Hauteur au-dessus du plan (UA)':'Distance au plan stellaire (pc)';$('zoomSlider').max=String(Math.log2(solar.active?1e21:1e12));$('zoomValue').max=String(solar.active?1e21:1e12);}$('zoomValue').value=(zoomMotion.active?zoomMotion.target:camera.zoom).toPrecision(6);$('zoomSlider').value=Math.log2(zoomMotion.active?zoomMotion.target:camera.zoom);$('centerX').value=camera.x.toPrecision(17);$('centerY').value=camera.y.toPrecision(17);if(document.activeElement!==$('cameraHeight'))$('cameraHeight').value=cameraHeight().toPrecision(8);dirty=true;}
- function stopTracking(){Object.assign(trackingPan,{x:0,y:0});Object.assign(solarTrackingPan,{x:0,y:0});solarTracked=null;trackedId=null;displayAnchor=null;dirty=true;}
- function updateTracking(){if(solar.active)updateSolarTracking();if(!trackedId||!materials||physicsBusy)return;const p=resolveMatter(trackedId,galacticOffset());displayAnchor=p;const x=p.x+trackingPan.x,y=p.y+trackingPan.y;if(camera.x!==x||camera.y!==y){camera.x=x;camera.y=y;cameraControls();}updateStarCard();}
- function limitZoom(value){if(solar.active)return solarZoomLimit(value);let z=Math.max(1,Math.min(1e12,value));if(!Number.isFinite(z))return camera.zoom;
-  const targetId=trackedId||selected;if(targetId&&materials&&grid){const p=resolveMatter(targetId,galacticOffset()),R=stellarProperties(targetId).radius*StellarPopulation.solarRadiusPc*1.05,lateral=Math.hypot(p.x-camera.x,p.y-camera.y)*lengthPc();if(lateral<R){const limit=2*grid.extent*lengthPc()/(2*Math.tan(camera.fovDegrees*Math.PI/360)*Math.sqrt(R*R-lateral*lateral));z=Math.min(z,limit);}}
-  return z;
- }
- function applyZoom(z,anchor=null){if(solar.active&&anchor&&!solarTracked){const ratio=camera.zoom/z;solarCamera.x=anchor.x+(solarCamera.x-anchor.x)*ratio;solarCamera.y=anchor.y+(solarCamera.y-anchor.y)*ratio;}if(anchor&&!solar.active&&!trackedId){const ratio=camera.zoom/z;camera.x=anchor.x+(camera.x-anchor.x)*ratio;camera.y=anchor.y+(camera.y-anchor.y)*ratio;}camera.zoom=z;cameraControls();}
- function changeZoom(value,anchor=null){const z=limitZoom(value);zoomMotion.cancel(z);applyZoom(z,anchor);}
- function requestZoom(value,anchor=null){const z=limitZoom(value);if(z<camera.zoom){changeZoom(z,anchor);observationKey='';dirty=true;}else{zoomMotion.to(z,performance.now(),anchor);cameraControls();}}
- function exposeForStar(){if(solar.active){exposeSolarBody(solarSelected||selected||solar.active.system.starId);return;}if(!selected||!grid)return;const p=resolveMatter(selected,galacticOffset()),ctx=viewContext(camera,false),width=ctx.worldSpan,view={width,cameraWidth:ctx.worldShortSpan,pixel:width,left:camera.x-width/2,bottom:camera.y-width/2,centerX:camera.x,centerY:camera.y,resolution:1,image:new Float64Array(1),mass:0,expected:0};
-  const source=lightPlan(view,[p],{population:materials.population,gain:lightGain,context:ctx,lengthPc:lengthPc(),fovDegrees:camera.fovDegrees}).candidates[0];if(!source)return;
-  const target=source.photosphereResolved?.4:12;$('exposure').value=Math.max(-80,Math.min(16,Math.round(Math.log2(target/source.peak)*4)/4));objectExposure=true;observationKey='';dirty=true;
- }
- async function reset(){
-  pendingReference=null;referenceSequence++;referenceDraft=false;referenceError='';referenceLastId='';solar.destroy();Object.assign(trackingPan,{x:0,y:0});Object.assign(solarTrackingPan,{x:0,y:0});solarLagNs=0n;solarSelected=solarTracked=null;$('systemOverlay').setAttribute('hidden','');$('systemBodyCard').hidden=true;
-  const token=++generation;loading=true;physicsBusy=false;displayAnchor=null;gpuLightRenderer?.destroy();gpuLightRenderer=null;sceneCanvas=document.createElement('canvas');localDynamics?.destroy();grid?.destroy?.();grid=null;running=manual=false;revision=0;drag=null;zoomMotion.cancel(camera.zoom);renderCamera=observationCamera=null;renderFrameContext=presentedView=presentedContext=renderedPoints=renderProjection=null;renderSolarScene=observationSolarScene=null;paintedRevision=-1;observationRevision=0;
-  if(objectExposure){$('exposure').value=String(defaultExposure);objectExposure=false;}
-  clock.integrated=clock.debt=clock.remainder=0n;phaseCache=null;phaseKey=observationKey='';points=[];stellarPoints=[];stellarProjection=stellarSampleInfo=null;stellarDetail=0;selected=trackedId=null;lastSampleZoom=0;retainedCount=0;retentionMode='none';photometricFilter=null;localDynamics=new LocalStellarDynamics();$('materialId').value='';$('selectedStar').textContent='';$('lookupStatus').textContent='';$('starCard').hidden=true;$('starHint').hidden=false;showTab('simulation');
-  lastCost=lastObserveCost=lastRenderCost=lastSteps=lastAdvanced=detailWeight=0;rateAnchor=0n;rateStamp=lastWall=performance.now();actualRate=0;
-  $('pause').disabled=$('step').disabled=true;$('pause').textContent='Démarrer';
-  const[n,nv]=$('resolution').value.split(',').map(Number),initial=initialBodies(Number($('count').value),$('scenario').value,417,{softening:Number($('softening').value),structure:Number($('structure').value)});
-  physics=initial.physics||{gravity:.48,softening:Number($('softening').value),haloV2:0,extent:1.5,vmax:2};calibration=initial.calibration||null;
-  $('populationNotice').textContent=calibration&&$('population').value!=='11'?'Population expérimentale : masses et vitesses MW conservées, mais la densité en nombre n’est plus celle du profil de référence.':'';
-  $('physicalProfile').textContent=calibration?`Voie lactée simplifiée · 100 milliards d’étoiles · diamètre ${number(calibration.radiusKpc*2)} kpc (~100 000 al) · disque exponentiel ${calibration.scaleKpc} kpc, barre et bras perturbés (${Math.round(physics.structure*100)} %). Masse stellaire moyenne ${number(calibration.meanStarMass)} M☉, total ${number(calibration.massMsun)} M☉. Vitesse circulaire de fond à 8,2 kpc : ${number(calibration.solarCircularKmS)} km/s ; moyenne initiale ${number(calibration.meanSpeedKmS)} km/s. Densité du disque moyennée en azimut : ${number(calibration.surfaceSolar)} étoiles/pc² au rayon solaire (~${number(calibration.numberDensitySolar)} étoiles/pc³ avec épaisseur supposée). Dynamique plane + halo lisse ; population de champ synthétique, pas une reconstruction exacte de notre Galaxie.`:'Scénario pédagogique en unités réduites ; échelle optique illustrative de 10 kpc/unité.';
-  $('structureControls').hidden=!calibration;
-  try{
-   if($('engine').value==='gpu'){
-    $('backendStatus').textContent='Initialisation WebGPU…';const next=await GPUKineticMatter.create({n,nv,bodies:initial,...physics,physics:parameters()});if(token!==generation){next.destroy();return;}grid=next;grid.isGPU=true;
-    $('backendStatus').textContent=`WebGPU · ${n}² × ${nv}² · ${(grid.size*12/1048576).toFixed(0)} Mio principaux.`;
-   }else{grid=new TVDMatter({n,nv,extent:physics.extent,vmax:physics.vmax});grid.load(initial);$('backendStatus').textContent='CPU · FMM et transport TVD.';}
-   if(grid.isGPU){try{const renderer=await GPUStellarLightRenderer.create({device:grid.device});if(token!==generation){renderer.destroy();return;}gpuLightRenderer=renderer;}catch(e){console.warn('Rendu optique CPU : '+e.message);}}
-   renewDisplayCanvas(!!gpuLightRenderer);lightBackendChanged();solar.setDevice(grid.isGPU?grid.device:null);
-   materials=new PersistentMatter(grid,{population:10n**BigInt($('population').value),seed:$('scenario').value+':'+$('count').value+':417'+(calibration?':structure='+physics.structure:'')});
-   if(grid.isGPU){try{await localDynamics.attachGPU(grid.device);}catch(e){localDynamics.gpuFallback=e.message;}if(token!==generation)return;}
-   if(!grid.isGPU)grid.field(parameters());materials.setField(grid.ax,grid.ay);
-   const ownerMaterials=materials,ownerLocal=localDynamics,ownerGrid=grid;
-   grid.onTransport=grid.isGPU?async({dt,ax,ay})=>{if(ownerLocal.active.length)ownerMaterials.setField(ax,ay);await ownerLocal.advance(dt,ownerMaterials,ownerGrid);ownerMaterials.step(dt,ax,ay);}:({dt,ax,ay})=>{if(ownerLocal.active.length)ownerMaterials.setField(ax,ay);ownerLocal.advance(dt,ownerMaterials,ownerGrid);ownerMaterials.step(dt,ax,ay);};
-   scale=Math.max(...smooth(grid.mass,n));lightGain=4*grid.dx*grid.dx/scale;refresh();initialL=diagnostics.angularMomentum;
-   cameraControls();await observe(true);if(token!==generation)return;draw();
-  }catch(e){if(token!==generation)return;if($('engine').value==='gpu'){$('engine').value='cpu';$('resolution').value='28,25';await reset();$('backendStatus').textContent='Repli CPU : '+e.message;}else $('backendStatus').textContent='Initialisation impossible : '+e.message;
-  }finally{if(token===generation){loading=false;$('pause').disabled=$('step').disabled=false;lastWall=performance.now();}}
- }
- function smooth(mass,n){const a=new Float64Array(mass.length),b=new Float64Array(mass.length);for(let y=0;y<n;y++)for(let x=0;x<n;x++)a[y*n+x]=(2*mass[y*n+x]+(x?mass[y*n+x-1]:0)+(x<n-1?mass[y*n+x+1]:0))/4;for(let y=0;y<n;y++)for(let x=0;x<n;x++)b[y*n+x]=(2*a[y*n+x]+(y?a[(y-1)*n+x]:0)+(y<n-1?a[(y+1)*n+x]:0))/4;return b;}
- function refresh(){diagnostics=grid.diagnostics();dirty=true;}
- function stellarKey(view,selectedStar){const shape=screenShape();return[shape.cssSpan,shape.pixelRatio,shape.aspectX,shape.aspectY,revision,view.x,view.y,view.zoom,view.fovDegrees,selectedStar,trackedId,$('exposure').value,lightCalibration.budget,lightCalibration.onset,$('adaptiveSources').checked,$('population').value,galacticOffset(),$('localStars').checked,$('psfWidth').value].join(':');}
- function captureStellar(){observationCamera=viewFrame(projection);observationSolarScene=null;stellarPoints=points;stellarProjection=projection;stellarSampleInfo=sampleInfo;stellarDetail=detailWeight;}
- function observeStellar(view,selectedStar,key,now){retentionMode=lastSampleZoom>view.zoom?'zoom-out':lastSampleZoom<view.zoom?'zoom-in':'steady';retainedCount=0;const ctx=viewContext(view,false),shape=ctx;view={...view,aspectX:shape.aspectX,aspectY:shape.aspectY};const imageZoom=2*grid.extent/ctx.worldSpan,observationOffset=galacticOffset();
-  projection=viewportProjection(projectDensityLight(grid,{...view,zoom:imageZoom,resolution:view.zoom<64?192:64}),view.aspectX,view.aspectY);projection.expected=Number(materials.population)*projection.viewMass;projection.zoom=view.zoom;projection.cameraWidth=ctx.worldShortSpan;projection.fovDegrees=view.fovDegrees;
-  const budget=budgetForProjection(projection),sigma=Math.max(.5,Math.min(3,stellarOptics.sigma));
-  materials.coordinateCacheLimit=Math.max(materials.coordinateCacheLimit,Math.min(1048576,Math.max(32768,budget*3)));reserveStellarProperties(budget);
-  detailWeight=budget>lightSourceLimit()?0:stellarDetailLevel(projection.expected,budget,lightCalibration.onset);
-  const minimum=minimumLuminosity(projection,{population:materials.population,gain:lightGain,sigma,exposureEV:Number($('exposure').value),fovDegrees:view.fovDegrees,context:ctx})/Math.max(detailWeight,1e-30);
-  let threshold=minimum,filter=StellarPopulation.luminosityFilter(threshold);
-  for(let i=0;i<32&&projection.expected*filter.fraction>budget*.5&&filter.fraction>0;i++){threshold*=2;const next=StellarPopulation.luminosityFilter(threshold);if(next.fraction===0)break;filter=next;}
-  if(!photometricFilter||photometricFilter.key!==filter.key)photometricFilter=filter;
-  if(!$('localStars').checked||detailWeight===0||filter.fraction===0){points=[];sampleInfo={points:[],estimated:BigInt(Math.max(0,Math.round(projection.expected))),truncated:false,unresolved:true};lastSampleZoom=view.zoom;observationKey=key;lastObservation=now;lastObserveCost=performance.now()-now;observationRevision++;dirty=true;captureStellar();return;}
-  sampleInfo=materials.sample({...view,zoom:imageZoom,budget,offset:observationOffset,rankFilter:photometricFilter,boundaryTolerance:ctx.observationTolerance});
-  // Preserve visible identities across sampling/LOD changes, in a bounded cache.
-  // Refresh their positions from the same characteristics, not stale snapshots.
-  const half=ctx.worldSpan/2,geometry=cameraGeometry(projection,{lengthPc:lengthPc(),fovDegrees:view.fovDegrees,context:ctx}),minimumFlux=minimum*StellarPopulation.solarFluxAtPc/(geometry.heightPc*geometry.heightPc),merged=new Map();
-  const prior=retentionMode==='zoom-out'?[]:stellarPoints.map(p=>resolveMatter(p.id,observationOffset)),priorIds=prior.map(p=>p.id);
-  // sample() already evaluated the collective position at this exact offset.
-  // Apply the same local correction directly, then deduplicate before optics.
-  const sampleTime=materials.time+observationOffset,candidates=new Map();
-  for(const p of [...prior,...sampleInfo.points.map(p=>localDynamics.correct(p,sampleTime)),...localDynamics.visible(materials,{...view,zoom:imageZoom},grid.extent,observationOffset)])candidates.set(p.id,p);
-  for(const point of candidates.values()){
-   if(Math.abs(point.x-view.x)>half*view.aspectX||Math.abs(point.y-view.y)>half*view.aspectY)continue;
-   const photometry=point.photometry||stellarProperties(point.id),flux=sourceVisibleFlux(point,geometry,photometry);if(flux<minimumFlux)continue;
-   // Carry immutable birth photometry into rendering; the physical position stays fresh.
-   if(!point.photometry)point.photometry=photometry;
-   merged.set(point.id,{point,flux});
+  "use strict";
+  const $ = (id) => document.getElementById(id),
+    clock = new SimulationClock(),
+    camera = { x: 0, y: 0, zoom: 1, fovDegrees: 50 };
+  const solar = new PlanetarySystems.Manager(),
+    solarCamera = { x: 0, y: 0 },
+    trackingPan = { x: 0, y: 0 },
+    solarTrackingPan = { x: 0, y: 0 };
+  let solarLagNs = 0n,
+    solarSelected = null,
+    solarTracked = null,
+    solarSavedMask = true,
+    solarGuideIds = new Set(),
+    solarGPUguides = [];
+  const lightRenderer = new StellarLightRenderer(600);
+  let projection = null,
+    lightStats = null,
+    lightGain = 1;
+  const frames = new FramePublication();
+  const zoomMotion = new SmoothZoom(),
+    displayFPS = new FrameRateMeter(),
+    renderFPS = new FrameRateMeter();
+  let sceneCanvas = document.createElement("canvas"),
+    gpuLightRenderer = null,
+    observationCamera = null,
+    presentedView = null,
+    presentedContext = null,
+    observationSolarScene = null,
+    observationRevision = 0,
+    lastHud = 0,
+    physicsBusy = false,
+    displayAnchor = null;
+  let speedMode = "rate",
+    rateContext = "galaxy",
+    rateCeiling = unitNs("Gy");
+  let referenceDraft = false,
+    referenceError = "",
+    referenceLastId = "",
+    referenceBusy = false,
+    pendingReference = null,
+    referenceSequence = 0,
+    referenceDraftVersion = 0;
+  const defaultLightCalibration = Object.freeze({ budget: 8192, onset: 160 }),
+    lightCalibration = { ...defaultLightCalibration };
+  const defaultStellarOptics = Object.freeze({
+      sigma: 1,
+      glare: 0.65,
+      angle: 15,
+      profile: "starburst",
+    }),
+    defaultExposure = -4.5;
+  let stellarOptics = {
+      ...defaultStellarOptics,
+      shape: { ...DEFAULT_OPTICAL_SHAPE },
+      fade: { ...DEFAULT_STELLAR_FADE },
+    },
+    effectiveLightBudget = lightCalibration.budget,
+    adaptiveDensityRatio = 0;
+  const opticalFields = ["haloExtent", "spikeLength", "spikeMin", "spikeMax"],
+    fadeFields = ["fadeStart", "fadeEnd", "fadeCurve"];
+  function applyStellarOptics() {
+    try {
+      const shape = readOpticalShape(
+          Object.fromEntries(opticalFields.map((id) => [id, $(id).value])),
+        ),
+        fade = readStellarFade({
+          enabled: $("stellarFadeEnabled").checked,
+          start: $("fadeStart").value,
+          end: $("fadeEnd").value,
+          curve: $("fadeCurve").value,
+        }),
+        sigma = Number($("psfWidth").value),
+        glare = Number($("glareStrength").value),
+        angle = Number($("spikeAngle").value);
+      if (!Number.isFinite(sigma) || sigma < 0.5 || sigma > 3)
+        throw Error("La largeur du cœur doit être comprise entre 0,5 et 3 px.");
+      if (
+        !Number.isFinite(glare) ||
+        glare < 0 ||
+        glare > 0.8 ||
+        !Number.isFinite(angle)
+      )
+        throw Error("Réglages optiques invalides.");
+      if (gpuLightRenderer) {
+        const radius = opticalKernelSupport(
+            sigma * screenShape().pixelRatio,
+            1e20,
+            shape,
+          ).radius,
+          side = 2 * radius + 1,
+          limits = gpuLightRenderer.device.limits;
+        if (
+          side > limits.maxTextureDimension2D ||
+          side * side * 8 > limits.maxStorageBufferBindingSize
+        )
+          throw Error(
+            "Ce profil dépasse la capacité graphique. Réduire sa portée ou sa largeur.",
+          );
+      }
+      stellarOptics = {
+        sigma,
+        glare,
+        angle,
+        profile: $("opticalProfile").value,
+        shape,
+        fade,
+      };
+      for (const id of [...opticalFields, ...fadeFields])
+        $(id).setAttribute("aria-invalid", "false");
+      $("stellarOpticsStatus").textContent =
+        "Appliqué · cœur " +
+        sigma +
+        " px · halo " +
+        shape.haloExtent +
+        " × · aigrettes " +
+        shape.spikeLength +
+        " ×";
+      $("stellarOpticsStatus").setAttribute("data-error", "false");
+      objectExposure = false;
+      observationKey = "";
+      dirty = true;
+      return true;
+    } catch (e) {
+      $("stellarOpticsStatus").textContent = e.message;
+      $("stellarOpticsStatus").setAttribute("data-error", "true");
+      if (e.field) $(e.field).setAttribute("aria-invalid", "true");
+      return false;
+    }
   }
-  points=selectObservedSources(Array.from(merged.values()),priorIds,budget);
-  if(selectedStar&&budget>0){const p=resolveMatter(selectedStar,observationOffset),half=ctx.worldSpan/2;if(Math.abs(p.x-view.x)<=half*view.aspectX&&Math.abs(p.y-view.y)<=half*view.aspectY&&!points.some(q=>q.id===p.id)){if(points.length>=budget)points.pop();points.push(p);}}
-  const previousIds=new Set(priorIds);retainedCount=points.reduce((count,p)=>count+Number(previousIds.has(p.id)),0);
-  lastSampleZoom=view.zoom;observationKey=key;lastObservation=now;lastObserveCost=performance.now()-now;observationRevision++;dirty=true;
- captureStellar();
- }
- async function observe(force=false){if(!grid)return;if(await prepareSolar()){observeSolar(force);return;}const token=generation,now=performance.now(),key=stellarKey(camera,selected);if(key===observationKey||(!force&&now-lastObservation<33))return;await prepareLocal();if(token!==generation)return;updateTracking();observeStellar(camera,selected,stellarKey(camera,selected),now);points=stellarPoints.map(p=>stellarAppearance(p,trackedId||selected,solarWidthAU()));}
+  const lightSourceLimit = () =>
+    gpuLightRenderer?.sourceLimit ?? Number.MAX_SAFE_INTEGER;
+  function updateAdaptiveControls() {
+    const enabled = $("adaptiveSources").checked;
+    for (const id of ["starBudget", "budgetHalve", "budgetDouble"])
+      if ($(id).disabled !== enabled) $(id).disabled = enabled;
+    if (!enabled) effectiveLightBudget = lightCalibration.budget;
+    const status = enabled
+      ? "Adaptatif · plafond actif " +
+        effectiveLightBudget.toLocaleString("fr-FR") +
+        " · densité " +
+        adaptiveDensityRatio.toFixed(2) +
+        " × la référence"
+      : "Manuel · plafond " + lightCalibration.budget.toLocaleString("fr-FR");
+    if ($("adaptiveSourcesStatus").textContent !== status)
+      $("adaptiveSourcesStatus").textContent = status;
+    const label = enabled
+      ? "Plafond manuel conservé"
+      : "Plafond de sources lumineuses";
+    if ($("starBudgetLabel").textContent !== label)
+      $("starBudgetLabel").textContent = label;
+    const reference = calibration
+      ? "Référence : densité moyenne au rayon solaire."
+      : "Référence : densité moyenne du domaine.";
+    if ($("adaptiveReference").textContent !== reference)
+      $("adaptiveReference").textContent = reference;
+  }
 
- function paint(){
-   if(paintedRevision===observationRevision)return;const renderStarted=performance.now();
-   const complete=!!sampleInfo&&!sampleInfo.unresolved&&!sampleInfo.truncated&&BigInt(solar.active?stellarPoints.length:points.length)===sampleInfo.estimated;
-   const ctx=imageContext(),{size,pixelWidth,pixelHeight}=ctx,rasterProjection=projection.aspectX===ctx.aspectX&&projection.aspectY===ctx.aspectY?projection:viewportProjection(projection,ctx.aspectX,ctx.aspectY);(gpuLightRenderer||lightRenderer).resize(pixelWidth,pixelHeight);
-   lightStats=(gpuLightRenderer||lightRenderer).render(gpuLightRenderer?null:sceneCanvas,rasterProjection,points,{detailWeight,population:materials.population,gain:lightGain,exposureEV:Number($('exposure').value),sigma:ctx.sigmaPixels,context:ctx,complete,selected:solar.active?(solarSelected||selected):selected,glare:stellarOptics.glare,opticalProfile:stellarOptics.profile,spikeAngle:stellarOptics.angle,opticalShape:stellarOptics.shape,stellarFade:stellarOptics.fade,lengthPc:ctx.lengthPc,normalizationLengthPc:lengthPc(),fovDegrees:ctx.fovDegrees});
-   lastRenderCost=performance.now()-renderStarted;
-   renderCamera=observationCamera;renderFrameContext=ctx;renderedPoints=points;renderProjection=rasterProjection;renderSolarScene=observationSolarScene;paintedRevision=observationRevision;renderFPS.tick(performance.now());
-   setContextSpeed(solar.active?'system':lightStats.sources.length?'stars':'galaxy');$('continuous').setAttribute('data-neighbor-star-count',String(solar.active?lightStats.sources.filter(p=>p.stellarNeighbor).length:0));$('continuous').setAttribute('data-render-exposure',String($('exposure').value));$('continuous').setAttribute('data-reflected-count',String(lightStats.reflectedCount||0));$('continuous').setAttribute('data-disc-count',String(lightStats.discCount||0));$('continuous').setAttribute('data-diffuse-fraction',String(lightStats.residual));
-   $('continuous').setAttribute('data-diffuse-coverage',String(lightStats.diffuseCoverage));$('continuous').setAttribute('data-estimated-population',String(lightStats.estimatedPopulation));
-   $('continuous').setAttribute('data-camera-x',String(camera.x));$('continuous').setAttribute('data-camera-y',String(camera.y));$('continuous').setAttribute('data-tracked-id',trackedId||'');
-   $('continuous').setAttribute('data-source-retention',retentionMode);$('continuous').setAttribute('data-retained-source-count',String(retainedCount));
-   if(retentionMode!=='steady'){$('continuous').setAttribute('data-last-zoom-direction',retentionMode);$('continuous').setAttribute('data-last-zoom-retained-count',String(retainedCount));}
-   $('continuous').setAttribute('data-inferred-source-count',String(points.length));$('continuous').setAttribute('data-source-budget',String(effectiveLightBudget));$('continuous').setAttribute('data-adaptive-sources',String($('adaptiveSources').checked));$('continuous').setAttribute('data-density-ratio',String(adaptiveDensityRatio));$('continuous').setAttribute('data-source-onset',String(lightCalibration.onset));$('continuous').setAttribute('data-render-backend',gpuLightRenderer?'GPU':'CPU');$('continuous').setAttribute('data-stellar-detail',String(detailWeight));$('continuous').setAttribute('data-observation-zoom',String(projection.zoom));$('continuous').setAttribute('data-sampling-truncated',String(!!sampleInfo?.truncated));
-   // The display loop presents the committed image and its overlays together.
- }
- // Presentation can run while an async observation prepares a different frame.
- function viewFrame(image=null,ctx=null){
-  ctx??=image?{worldSpan:image.width,worldShortSpan:image.cameraWidth??image.width}:viewContext();const local=!!solar.active,hostId=local?solar.active.system.starId:(trackedId||selected),host=hostId?resolveMatter(hostId):null,originX=host?.x||0,originY=host?.y||0,unitPc=local?PlanetarySystems.AU_PC:lengthPc(),id=local?solarTracked:trackedId;
-  const anchor=id?(local?solar.resolve(id,solarOffsetYear()):resolveMatter(id)):null;
-  return{space:local?'system':'galaxy',referenceId:local?hostId:null,originX,originY,modelLengthPc:lengthPc(),unitPc,x:(image?.centerX??(local?solarCamera.x:camera.x))-(local?0:originX),y:(image?.centerY??(local?solarCamera.y:camera.y))-(local?0:originY),width:image?.width??ctx.worldSpan,cameraWidth:image?.cameraWidth??ctx.worldShortSpan,zoom:image?.zoom??camera.zoom,fovDegrees:image?.fovDegrees??camera.fovDegrees,follow:anchor?{id,x:anchor.x-(local?0:originX),y:anchor.y-(local?0:originY)}:null};
- }
- function present(shape=screenShape()){if(!grid||!renderCamera||!renderFrameContext)return;syncReference();const output=$('continuous'),size=renderFrameContext.pixelSpan,requested=committedCameraView(renderCamera,viewFrame(null,viewContext(camera,!!solar.active,shape)),solar.active?solarTrackingPan:trackingPan),choice=coveredCameraView(renderCamera,requested,renderFrameContext,shape),view=choice.view,ctx=renderContext(shape,{worldShortSpan:view.cameraWidth,worldSpan:view.width,fovDegrees:view.fovDegrees??camera.fovDegrees,sigmaCss:stellarOptics.sigma,units:view.space==='system'?'AU':'model',lengthPc:view.unitPc});presentedView=view;presentedContext=ctx;const transform=cameraPresentation(renderCamera,view,shape.size),ratio=transform.scale*shape.size/size,dx=transform.x,dy=transform.y,width=2*grid.extent/camera.zoom;
-  updateSolarOverlay(view,ctx);
-  if(gpuLightRenderer)gpuLightRenderer.present(output,{scale:ratio,x:dx,y:dy,guides:solarGPUguides,width:shape.pixelWidth,height:shape.pixelHeight,context:ctx});else{if(output.width!==shape.pixelWidth||output.height!==shape.pixelHeight){output.width=shape.pixelWidth;output.height=shape.pixelHeight;}const c=output.getContext('2d');c.fillStyle='#000';c.fillRect(0,0,shape.pixelWidth,shape.pixelHeight);c.drawImage(sceneCanvas,shape.pixelWidth/2+dx-sceneCanvas.width*ratio/2,shape.pixelHeight/2+dy-sceneCanvas.height*ratio/2,sceneCanvas.width*ratio,sceneCanvas.height*ratio);}
-  $('viewHud').textContent=solar.active?'Système · champ '+number(ctx.worldWidth)+' × '+number(ctx.worldHeight)+' UA · '+(lightStats?.discCount||0)+' surfaces · '+(lightStats?.sources.filter(p=>p.stellarNeighbor).length||0)+' étoiles voisines · '+solar.active.states.length+' corps FMM GPU':'×'+number(view.zoom)+' · '+(lightStats?.drawn.length||0)+' sources résolues'+(calibration?' · champ '+number(ctx.worldWidth*lengthPc())+' × '+number(ctx.worldHeight*lengthPc())+' pc':'');output.setAttribute('data-hdr-width',String(gpuLightRenderer?.width||sceneCanvas.width));output.setAttribute('data-hdr-height',String(gpuLightRenderer?.height||sceneCanvas.height));output.setAttribute('data-pixel-ratio',String(shape.pixelRatio));output.setAttribute('data-navigation-pending',String(choice.pending));output.setAttribute('data-presented-zoom',String(view.zoom));output.setAttribute('data-presented-x',String(view.x));output.setAttribute('data-presented-y',String(view.y));output.setAttribute('data-world-width',String(ctx.worldWidth));output.setAttribute('data-world-height',String(ctx.worldHeight));output.setAttribute('data-sigma-css',String(ctx.sigmaCss));output.setAttribute('data-viewport-aspect',String(shape.aspectX/shape.aspectY));output.setAttribute('data-presentation-backend',gpuLightRenderer?'GPU':'CPU');output.setAttribute('data-optical-zoom',String(view.zoom));output.setAttribute('data-zoom-target',String(zoomMotion.target));output.setAttribute('data-zoom-animating',String(zoomMotion.active));output.setAttribute('data-camera-x',String(camera.x));output.setAttribute('data-camera-y',String(camera.y));output.setAttribute('data-tracked-id',trackedId||'');output.setAttribute('data-system-host',solar.active?.system.starId||'');output.setAttribute('data-system-tracked',solarTracked||'');output.setAttribute('data-system-x',String(solarCamera.x));output.setAttribute('data-system-y',String(solarCamera.y));output.setAttribute('data-tracking-offset-x',String(solar.active?solarTrackingPan.x:trackingPan.x));output.setAttribute('data-tracking-offset-y',String(solar.active?solarTrackingPan.y:trackingPan.y));}
- function renewDisplayCanvas(gpu){const mode=gpu?'webgpu':'2d';if(canvas.getAttribute?.('data-context-mode')!==mode&&canvas.cloneNode){const next=canvas.cloneNode(false);canvas.replaceWith(next);canvas=next;bindCameraCanvas(canvas);}canvas.setAttribute('data-context-mode',mode);}
+  function budgetForProjection(field) {
+    const result = StellarObservationPolicy.stellarSourceBudget(field, {
+      lengthPc: lengthPc(),
+      population: materials.population,
+      calibration,
+      extent: grid.extent,
+      adaptive: $("adaptiveSources").checked,
+      manualBudget: lightCalibration.budget,
+      sourceLimit: lightSourceLimit(),
+    });
+    adaptiveDensityRatio = result.densityRatio;
+    effectiveLightBudget = result.budget;
+    return result.budget;
+  }
+  function lightCalibrationLabel() {
+    return (
+      ($("adaptiveSources").checked
+        ? "adaptatif · 4 096–16 384 sources"
+        : lightCalibration.budget.toLocaleString("fr-FR") + " sources") +
+      " · apparition ×" +
+      lightCalibration.onset
+    );
+  }
+  function showLightCalibration(error = null, suspended = false) {
+    $("lightCalibrationStatus").textContent = error
+      ? error.message +
+        (suspended
+          ? " Réduire le plafond pour afficher les sources."
+          : " Réglage conservé : " + lightCalibrationLabel())
+      : "Appliqué : " + lightCalibrationLabel();
+    $("lightCalibrationStatus").setAttribute("data-error", String(!!error));
+    for (const [id, key] of [
+      ["starBudget", "budget"],
+      ["starOnset", "onset"],
+    ])
+      $(id).setAttribute("aria-invalid", String(error?.field === key));
+  }
+  function applyLightCalibration() {
+    try {
+      const next = readLightCalibration(
+          $("starBudget").value,
+          $("starOnset").value,
+          lightSourceLimit(),
+        ),
+        changed =
+          next.budget !== lightCalibration.budget ||
+          next.onset !== lightCalibration.onset;
+      Object.assign(lightCalibration, next);
+      $("starBudget").value = String(next.budget);
+      $("starOnset").value = String(next.onset);
+      showLightCalibration();
+      updateAdaptiveControls();
+      if (changed) {
+        observationKey = "";
+        dirty = true;
+      }
+      return true;
+    } catch (error) {
+      showLightCalibration(error);
+      return false;
+    }
+  }
+  function lightBackendChanged() {
+    try {
+      readLightCalibration(
+        lightCalibration.budget,
+        lightCalibration.onset,
+        lightSourceLimit(),
+      );
+      showLightCalibration();
+    } catch (error) {
+      showLightCalibration(error, true);
+    }
+  }
 
- function animate(now){if(!document.hidden){if(!loading&&grid){updateTracking();const native=screenShape();if((renderSizeDirty||(gpuLightRenderer?.width||sceneCanvas.width)!==native.pixelWidth||(gpuLightRenderer?.height||sceneCanvas.height)!==native.pixelHeight)&&projection&&observationCamera){paintedRevision=-1;paint();renderSizeDirty=false;}if(zoomMotion.active){const anchor=zoomMotion.anchor,z=zoomMotion.at(now);applyZoom(z,anchor);}present(native);displayFPS.tick(now);}if(now-lastHud>=250){lastHud=now;const fps=displayFPS.rate(now),render=renderFPS.rate(now);$('fps').textContent=fps?fps.toFixed(0)+' FPS':'— FPS';$('renderRate').textContent=(gpuLightRenderer?'GPU · ':'CPU · ')+render.toFixed(0)+' images calculées/s';$('continuous').setAttribute('data-fps',String(fps));}}requestAnimationFrame(animate);}
- function draw(){if(!grid||!diagnostics)return;paint();
-  $('simulationState').textContent=running?'EN MARCHE':manual?'AVANCE MANUELLE':'EN PAUSE';$('time').value=(Number(clock.integrated)/Number(MODEL_NS)).toFixed(3);$('physicalTime').textContent=clock.format($('timeUnit').value);$('fineTime').textContent=clock.format('s');$('gridMass').value=(diagnostics.mass*100).toFixed(2)+' %';$('gridAngular').value=(diagnostics.angularMomentum-initialL).toExponential(1);
-  const displayUnit=rateUnit(),now=performance.now();if(now-rateStamp>=500){actualRate=Number(clock.visible()-rateAnchor)/Number(unitNs(displayUnit))*1000/(now-rateStamp);rateStamp=now;rateAnchor=clock.visible();}
-  const desired=clock.rateNumber()/Number(unitNs(displayUnit)),limited=running&&(clock.limited||(actualRate<desired*.85&&(grid.time>0||solar.active)));
-  $('rateStatus').textContent=rateError||`Demandé : ${number(desired)} ${displayUnit}/s · obtenu : ${number(Math.max(0,actualRate))} ${displayUnit}/s`+(limited?' · limité par le calcul.':'')+(limited&&localDynamics?.patch?' Pas local ≤ '+number(localDynamics.stepLimit*1e6)+' y.':'');
-  $('factorStatus').textContent='Facteur exact × '+clock.factorRatio()+' par rapport à 1 My/s.';
-  const meanNumber=lightStats?.estimatedPopulation||0,estimated=BigInt(Math.max(0,Math.round(meanNumber))),text=estimated.toString(),estimateText=meanNumber>0&&meanNumber<1?'moins de 1 (moyenne du champ)':text.length>8?text[0]+'.'+text.slice(1,4)+'e'+(text.length-1):text;
-  $('observationStatus').textContent=`${lightStats?.drawn.length||0} sources résolues (plafond ${effectiveLightBudget}) · population locale estimée : ${estimateText}. `+(lightStats?.complete&&detailWeight===1?'Toute la lumière locale est portée par les étoiles. ':`Fond statistique : ${(100*(lightStats?.diffuseCoverage||0)).toFixed(2)} % selon la densité estimée et la résolution optique. `)+(detailWeight===0?'Vue diffuse : rapprocher la caméra pour distinguer les étoiles. ':'')+`Identités persistantes · ${materials.groups.length.toLocaleString('fr-FR')} groupes transportés · états individuels limités au voisinage FMM.`+(sampleInfo?.truncated?' Budget de recherche atteint : échantillon incomplet.':'')+(materials.refinementLimited?' Limite de raffinement des trajectoires atteinte.':'');
-  if(solar.active)$('observationStatus').textContent=solar.active.states.length.toLocaleString('fr-FR')+' corps physiques · disques réfléchissant la lumière de l’étoile hôte · étoile sans aigrettes. '+'Rayons physiques ; contours pointillés pour les objets non résolus.';
-  $('lightCalibrationCount').textContent=solar.active?'Disques du système : '+(lightStats?.drawn.length||0).toLocaleString('fr-FR'):'Sources visibles : '+(lightStats?.drawn.length||0).toLocaleString('fr-FR')+' / '+effectiveLightBudget.toLocaleString('fr-FR');
-  updateStarCard();$('trackingStatus').textContent=trackedId?'Référentiel de '+stellarName(trackedId)+' · caméra attachée à cette identité.':'Caméra libre · vue perspective au-dessus du plan stellaire.';$('stopTracking').hidden=!trackedId;$('exposureValue').textContent=Number($('exposure').value).toFixed(2)+' EV';
-  const local=localDynamics.status();$('localStatus').textContent=local.reason+(local.active?' · '+local.count+' étoiles, garde '+number(local.widthPc)+' pc · '+local.ms.toFixed(1)+' ms':'')+' · '+local.backend+' · '+local.records+' trajectoires matérialisées.';$('localCount').textContent=local.count.toLocaleString('fr-FR')+' étoiles locales · '+local.backend;$('localCount').setAttribute('data-count',String(local.count));$('localCount').setAttribute('data-backend',local.backend);
-  updateSolarCard();updateSolarStatus();
-  $('status').textContent='Physique '+lastCost.toFixed(0)+' ms ('+lastSteps+' pas, '+number(lastAdvanced)+' My) · recherche '+lastObserveCost.toFixed(0)+' ms · lumière '+(gpuLightRenderer?'GPU, ':'CPU, ')+lastRenderCost.toFixed(0)+' ms CPU · masse restante '+(diagnostics.mass*100).toFixed(3)+' % · sorties espace '+(diagnostics.spatialLoss*100).toFixed(3)+' %. Le champ collectif continue au-delà de la zone locale.';dirty=false;
+  const rateUnit = () =>
+    speedMode === "rate"
+      ? $("speedUnit").value
+      : [
+          "Ty",
+          "Gy",
+          "My",
+          "ky",
+          "y",
+          "mo",
+          "w",
+          "d",
+          "h",
+          "min",
+          "s",
+          "ms",
+          "us",
+          "ns",
+        ].find((u) => clock.rateNumber() >= Number(unitNs(u))) || "ns";
+  let grid,
+    materials,
+    localDynamics,
+    running = false,
+    manual = false,
+    loading = false,
+    generation = 0,
+    revision = 0;
+  let physics = {
+      gravity: 0.48,
+      softening: 0.042,
+      haloV2: 0,
+      extent: 1.5,
+      vmax: 2,
+    },
+    calibration = null;
+  const parameters = () => ({
+    ...physics,
+    softening: Number($("softening").value),
+  });
+  const resolveMatter = (id, offset = galacticOffset()) =>
+    localDynamics
+      ? localDynamics.resolve(materials, id, offset)
+      : materials.resolve(id, offset);
+  function showTab(name) {
+    $("simulationPane").hidden = name !== "simulation";
+    $("objectPane").hidden = name !== "object";
+    $("advancedPane").hidden = name !== "advanced";
+    $("advancedTab").setAttribute("aria-selected", String(name === "advanced"));
+    $("simulationTab").setAttribute(
+      "aria-selected",
+      String(name === "simulation"),
+    );
+    $("objectTab").setAttribute("aria-selected", String(name === "object"));
+  }
+  async function prepareLocal() {
+    if (!grid || !materials) return;
+    const token = generation,
+      local = localDynamics;
+    await local.prepare(
+      materials,
+      grid,
+      {
+        ...camera,
+        zoom: (2 * grid.extent) / viewContext(camera, false).worldSpan,
+      },
+      {
+        ...parameters(),
+        totalMass: calibration?.massMsun || 0,
+        lengthPc: lengthPc(),
+        guard: Number($("localGuard").value),
+        enabled:
+          $("localDynamics").checked &&
+          !!calibration &&
+          $("population").value === "11",
+      },
+    );
+    if (token === generation)
+      clock.minimumStep = Math.min(
+        MIN_MODEL_STEP,
+        Math.max(1e-12, local.stepLimit),
+      );
+  }
 
- }
- function updateStarCard(){
-  $('starCard').hidden=!selected||!!solarSelected;$('starHint').hidden=!!selected;if(!selected||solarSelected)return;
-  const p=resolveMatter(selected,galacticOffset()),length=calibration?10000:1,velocity=calibration?calibration.velocityKmS:1,properties=stellarProperties(selected),anchor=trackedId?resolveMatter(trackedId,galacticOffset()):null;
-  if(!solarSelected&&document.activeElement!==$('materialId'))$('materialId').value=p.id;
-  $('starName').textContent=stellarName(p.id);$('selectedStar').textContent='ID · '+p.id;
-  $('starSpeed').textContent=(Math.hypot(p.vx,p.vy)*velocity).toPrecision(7)+(calibration?' km/s':' unités / My');
-  $('starVelocity').textContent=`vx=${(p.vx*velocity).toPrecision(7)}, vy=${(p.vy*velocity).toPrecision(7)}`+(calibration?' km/s':' unités / My');
-  $('starPositionLabel').textContent=calibration?'Coordonnées galactiques (pc)':'Coordonnées du modèle';
-  $('starPosition').textContent=`x=${(p.x*length).toPrecision(17)}, y=${(p.y*length).toPrecision(17)}`;
-  for(const [key,value]of Object.entries({x:p.x,y:p.y,vx:p.vx,vy:p.vy}))$('starPosition').setAttribute('data-'+key,String(value));
-  $('trackStar').textContent=(solar.active?solarTracked===selected:trackedId===selected)?'Arrêter le suivi':'Suivre · référentiel de cette étoile';$('trackStar').setAttribute('aria-pressed',String(solar.active?solarTracked===selected:trackedId===selected));
-  $('starRelative').textContent=anchor?`Δx=${number((p.x-anchor.x)*length)}, Δy=${number((p.y-anchor.y)*length)}${calibration?' pc':''} · |Δv|=${number(Math.hypot(p.vx-anchor.vx,p.vy-anchor.vy)*velocity)}${calibration?' km/s':''}`:'Référentiel galactique';
-  $('starMass').textContent=number(properties.mass)+' M☉';$('starLuminosity').textContent=number(properties.luminosity)+' L☉';$('starRadius').textContent=number(properties.radius)+' R☉ · '+number(properties.radius*StellarPopulation.solarRadiusM/1000)+' km';$('starTemperature').textContent=Math.round(properties.temperature).toLocaleString('fr-FR')+' K · '+properties.type;
-  if(renderProjection&&renderFrameContext){const ctx=renderFrameContext,framePoint=renderCamera.space==='system'?{...p,x:(p.x-renderCamera.originX)*lengthPc()/PlanetarySystems.AU_PC,y:(p.y-renderCamera.originY)*lengthPc()/PlanetarySystems.AU_PC}:p,optics=sourceOptics(framePoint,cameraGeometry(renderProjection,{lengthPc:ctx.lengthPc,fovDegrees:ctx.fovDegrees,context:ctx}));$('starDistance').textContent=number(optics.distancePc)+' pc';$('starFlux').textContent=number(optics.fluxWm2)+' W/m² (bolométrique)';$('starAppearance').textContent=photosphereResolution(optics.radiusPixels,ctx.sigmaPixels).resolved?'Photosphère résolue':'Disque non résolu · éclat optique';}
- }
- function syncReference(force=false){const id=solar.active?(solarTracked||''):(trackedId||''),input=$('referenceId'),focused=document.activeElement===input;if(id!==referenceLastId&&!focused&&!referenceBusy&&!pendingReference){referenceDraft=false;referenceError='';}referenceLastId=id;if(force||!referenceDraft){if(input.value!==id)input.value=id;}
-  let name='Caméra libre';if(id)name=solar.active?solar.resolve(id,solarOffsetYear()).name:stellarName(id);const status=referenceError||(referenceBusy||pendingReference?'Changement de référentiel…':referenceDraft?'Entrée pour valider · '+name:name);if($('referenceStatus').textContent!==status)$('referenceStatus').textContent=status;input.title=id;input.setAttribute('aria-invalid',String(!!referenceError));$('referenceControl').setAttribute('data-reference-id',id);$('releaseReference').disabled=!id&&!pendingReference&&!referenceBusy;
- }
- function requestReference(){referenceDraft=true;referenceError='';try{if(!grid||!materials||loading)throw Error('Attendre la préparation de la simulation.');let id=$('referenceId').value.trim();if(!id){pendingReference={kind:'free',sequence:++referenceSequence,draftVersion:referenceDraftVersion};return;}
-  if(/^\d+$/.test(id)){if(!solar.active)throw Error('Un rang seul demande un système ouvert.');id=solar.active.system.prefix+'/body/'+BigInt(id);}
-  const body=id.match(/^(.+)\/system\/v2\/body\/(0|[1-9]\d*)$/);if(body){if(!grid.isGPU||!gpuLightRenderer)throw Error('Ce référentiel demande WebGPU.');resolveMatter(body[1]);const system=solar.active?.system.starId===body[1]?solar.active.system:PlanetarySystems.describe(body[1]);PlanetarySystems.body(system,id);if(!solar.histories.has(body[1])&&solar.histories.size>=solar.maxSystems)throw Error('Budget des systèmes visités atteint.');pendingReference={kind:'body',id,starId:body[1],sequence:++referenceSequence,draftVersion:referenceDraftVersion};}
-  else{resolveMatter(id);pendingReference={kind:'star',id,sequence:++referenceSequence,draftVersion:referenceDraftVersion};}
- }catch(error){referenceError=error.message;}syncReference();}
- async function processReference(){const request=pendingReference;if(!request)return;pendingReference=null;referenceBusy=physicsBusy=true;try{
-  if(request.kind==='free'){stopTracking();}
-  else if(request.kind==='star'){leaveSolar();stopTracking();const p=resolveMatter(request.id);selected=trackedId=request.id;camera.x=p.x;camera.y=p.y;changeZoom(camera.zoom);showTab('object');}
-  else{const same=solar.active?.system.starId===request.starId;if(!same){leaveSolar();stopTracking();const p=resolveMatter(request.starId);selected=trackedId=request.starId;camera.x=p.x;camera.y=p.y;$('planetaryEnabled').checked=true;const description=PlanetarySystems.describe(request.starId);changeZoom(solarFullWidthAU()/(2.8*description.extent));if(!await prepareSolar())throw Error('Impossible d’ouvrir ce système.');}
-   await solar.activate(request.starId,clock.integrated,($('systemAsteroids').value==='auto'?null:Number($('systemAsteroids').value)),request.id);if(request.sequence!==referenceSequence)return;selected=trackedId=request.starId;solarSelected=solarTracked=request.id;Object.assign(solarTrackingPan,{x:0,y:0});const p=solar.resolve(request.id,solarOffsetYear());solarCamera.x=p.x;solarCamera.y=p.y;changeZoom(camera.zoom);showTab('object');}
-  if(request.sequence===referenceSequence){referenceError='';if(referenceDraftVersion===request.draftVersion)referenceDraft=false;}observationKey='';dirty=true;
- }catch(error){if(request.sequence===referenceSequence)referenceError=error.message;}finally{physicsBusy=referenceBusy=false;referenceLastId=solar.active?(solarTracked||''):(trackedId||'');syncReference(!referenceDraft&&!pendingReference&&request.sequence===referenceSequence);}}
- function displayRatio(value){if(!value.includes('/'))return value;const [a,b]=value.split('/').map(BigInt);let scale=1n;for(let digits=0;digits<=18;digits++,scale*=10n){if(scale%b===0n){const v=a*scale/b,whole=v/scale,tail=digits?(v%scale).toString().padStart(digits,'0').replace(/0+$/,''):'';return whole+(tail?'.'+tail:'');}}return value;}
- function boundSpeed(automatic=false){let clamped=false;if(clock.rateNumerator<clock.rateDenominator){clock.configureRate(1n,1n);clamped=true;}if(clock.rateNumerator>rateCeiling*clock.rateDenominator){clock.configureRate(rateCeiling,1n);clamped=true;}if(clamped){if(automatic&&speedMode==='rate')$('speedUnit').value=rateContext==='galaxy'?'Gy':'y';$('speedValue').value=displayRatio(clock.quantity($('speedUnit').value));$('factorValue').value=clock.factorRatio();}const slider=$('rateSlider');slider.min='0';slider.max='1000';slider.step='1';slider.value=String((Math.log10(clock.rateNumber()/1e9)+9)/(Math.log10(Number(rateCeiling)/1e9)+9)*1000);$('faster').disabled=clock.rateNumerator>=rateCeiling*clock.rateDenominator;$('slower').disabled=clock.rateNumerator<=clock.rateDenominator;if(clamped)$('pacePreset').value='custom';$('simulationBar').setAttribute('data-max-rate-ns',String(rateCeiling));$('simulationBar').setAttribute('data-rate-ns',String(clock.rateNumber()));$('simulationBar').setAttribute('data-rate-context',rateContext);return clamped;}
- function setContextSpeed(context){const changed=rateContext!==context;rateContext=context;rateCeiling=context==='system'?unitNs('y')/10n:context==='stars'?100n*unitNs('y'):unitNs('Gy');$('rateLimitLabel').textContent=context==='system'?'Système · plafond 0,1 an/s':context==='stars'?'Étoiles · plafond 100 ans/s':'Galaxie · plafond 1 Gy/s';if(boundSpeed(changed)){rateStamp=lastWall=performance.now();rateAnchor=clock.visible();actualRate=0;dirty=true;}}
- function speedChanged(){try{if(speedMode==='factor')clock.setFactor($('factorValue').value);else clock.setRate($('speedValue').value,$('speedUnit').value);boundSpeed();rateError='';const key=$('speedValue').value+':'+$('speedUnit').value;$('pacePreset').value=speedMode==='rate'&&['1:My','1:y','1:s','1:Gy'].includes(key)?key:'custom';rateStamp=lastWall=performance.now();rateAnchor=clock.visible();actualRate=0;dirty=true;}catch(e){rateError=e.message;$('rateStatus').textContent=e.message;dirty=true;}}
- function mode(next){speedMode=next;$('rateGroup').hidden=next!=='rate';$('factorGroup').hidden=next!=='factor';$('modeRate').setAttribute('aria-pressed',String(next==='rate'));$('modeFactor').setAttribute('aria-pressed',String(next==='factor'));if(next==='factor')$('factorValue').value=clock.factorRatio();else $('speedValue').value=clock.quantity($('speedUnit').value);dirty=true;}
- $('referenceId').addEventListener('input',()=>{referenceDraft=true;referenceError='';referenceDraftVersion++;syncReference();});$('referenceId').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();requestReference();}else if(event.key==='Escape'){event.preventDefault();referenceDraft=false;referenceError='';syncReference(true);}});$('applyReference').addEventListener('click',requestReference);$('releaseReference').addEventListener('click',()=>{referenceDraft=false;referenceError='';pendingReference={kind:'free',sequence:++referenceSequence,draftVersion:referenceDraftVersion};});
- $('modeRate').addEventListener('click',()=>mode('rate'));$('modeFactor').addEventListener('click',()=>mode('factor'));
- $('applySpeed').addEventListener('click',speedChanged);$('factorValue').addEventListener('change',speedChanged);
- for(const id of ['speedValue','factorValue'])$(id).addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();speedChanged();}});
- for(const [id,mult,div]of [['slower',1n,10n],['faster',10n,1n]])$(id).addEventListener('click',()=>{clock.configureRate(clock.rateNumerator*mult,clock.rateDenominator*div);if(speedMode==='factor')$('factorValue').value=clock.factorRatio();else $('speedValue').value=clock.quantity($('speedUnit').value);speedChanged();});
- $('pacePreset').addEventListener('change',()=>{if($('pacePreset').value==='custom')return;const[value,unit]=$('pacePreset').value.split(':');mode('rate');$('speedValue').value=value;$('speedUnit').value=unit;speedChanged();});
- for(const id of ['speedValue','speedUnit'])$(id).addEventListener('change',speedChanged);$('timeUnit').addEventListener('change',()=>{dirty=true;});
- $('scenario').addEventListener('change',()=>{if($('scenario').value==='milkyway'){$('population').value='11';$('softening').value='.015';}reset();});
- for(const id of ['count','softening'])$(id).addEventListener('change',reset);
- $('structure').addEventListener('input',()=>{$('structureValue').textContent=Math.round(Number($('structure').value)*100)+' %';});
- $('structure').addEventListener('change',reset);
- $('engine').addEventListener('change',()=>{$('resolution').value=$('engine').value==='gpu'?'64,33':'28,25';reset();});
- $('resolution').addEventListener('change',()=>{const n=Number($('resolution').value.split(',')[0]);$('engine').value=(n&(n-1))===0?'gpu':'cpu';reset();});
- $('reset').addEventListener('click',reset);
- $('pause').addEventListener('click',()=>{if(manual){manual=false;running=false;}else running=!running;if(!running&&clock.debt>=clock.quantum())clock.debt=0n;updateTracking();present();lastWall=performance.now();$('pause').textContent=running?'Pause':'Reprendre';dirty=true;});
- $('step').addEventListener('click',()=>{try{const amount=physicalNs($('stepValue').value,$('stepUnit').value);if(amount<=0n)throw Error('Durée strictement positive attendue.');running=false;clock.debt+=amount;manual=true;$('pause').textContent='Arrêter l’avance';dirty=true;}catch(e){$('rateStatus').textContent=e.message;}});
- $('zoomSlider').addEventListener('input',()=>requestZoom(2**Number($('zoomSlider').value)));$('zoomValue').addEventListener('change',()=>requestZoom(Number($('zoomValue').value)));
- $('zoomIn').addEventListener('click',()=>requestZoom((zoomMotion.active?zoomMotion.target:camera.zoom)*2));$('zoomOut').addEventListener('click',()=>requestZoom(camera.zoom/2));
- $('home').addEventListener('click',()=>{leaveSolar();stopTracking();if(objectExposure){$('exposure').value='0';objectExposure=false;}Object.assign(camera,{x:0,y:0,zoom:1});zoomMotion.cancel(1);cameraControls();});
- for(const id of ['centerX','centerY'])$(id).addEventListener('change',()=>{if(solar.active)leaveSolar();const x=Number($('centerX').value),y=Number($('centerY').value);if(grid&&Number.isFinite(x)&&Number.isFinite(y)){stopTracking();camera.x=Math.max(-grid.extent,Math.min(grid.extent,x));camera.y=Math.max(-grid.extent,Math.min(grid.extent,y));cameraControls();}});
- $('cameraHeight').addEventListener('change',()=>{const h=Number($('cameraHeight').value);if(grid&&Number.isFinite(h)&&h>0)changeZoom((solar.active?solarFullWidthAU():2*grid.extent*lengthPc())/(2*Math.tan(camera.fovDegrees*Math.PI/360)*h));else cameraControls();});
- $('cameraFov').addEventListener('change',()=>{const h=cameraHeight(),fov=Number($('cameraFov').value);if(grid&&Number.isFinite(fov)){camera.fovDegrees=Math.max(10,Math.min(100,fov));$('cameraFov').value=camera.fovDegrees;changeZoom((solar.active?solarFullWidthAU():2*grid.extent*lengthPc())/(2*Math.tan(camera.fovDegrees*Math.PI/360)*h));observationKey='';}});
- $('localStars').addEventListener('change',()=>{observationKey='';dirty=true;});
- for(const id of ['starBudget','starOnset']){$(id).addEventListener('change',applyLightCalibration);$(id).addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();applyLightCalibration();}});$(id).addEventListener('input',()=>{$('lightCalibrationStatus').textContent='Saisie en cours · réglage actif : '+lightCalibrationLabel();});}
- $('applyLightCalibration').addEventListener('click',applyLightCalibration);
- $('resetLightCalibration').addEventListener('click',()=>{$('adaptiveSources').checked=false;$('starBudget').value=String(defaultLightCalibration.budget);$('starOnset').value=String(defaultLightCalibration.onset);applyLightCalibration();});
- for(const [id,key,multiplier]of [['budgetHalve','budget',.5],['budgetDouble','budget',2],['onsetHalve','onset',.5],['onsetDouble','onset',2]])$(id).addEventListener('click',()=>{try{const next=readLightCalibration($('starBudget').value,$('starOnset').value);next[key]=key==='budget'?Math.floor(next[key]*multiplier):next[key]*multiplier;$('starBudget').value=String(next.budget);$('starOnset').value=String(next.onset);applyLightCalibration();}catch(error){showLightCalibration(error);}});
- for(const id of ['psfWidth','glareStrength','spikeAngle','opticalProfile',...opticalFields,...fadeFields,'stellarFadeEnabled'])$(id).addEventListener('input',applyStellarOptics);
- $('resetStellarOptics').addEventListener('click',()=>{for(const [id,value]of Object.entries({psfWidth:defaultStellarOptics.sigma,glareStrength:defaultStellarOptics.glare,spikeAngle:defaultStellarOptics.angle,opticalProfile:defaultStellarOptics.profile,...DEFAULT_OPTICAL_SHAPE,fadeStart:DEFAULT_STELLAR_FADE.start,fadeEnd:DEFAULT_STELLAR_FADE.end,fadeCurve:DEFAULT_STELLAR_FADE.curve}))$(id).value=String(value);$('stellarFadeEnabled').checked=DEFAULT_STELLAR_FADE.enabled;applyStellarOptics();});
- $('adaptiveSources').addEventListener('change',()=>{$('starBudget').value=String(lightCalibration.budget);updateAdaptiveControls();if($('lightCalibrationStatus').getAttribute('data-error')!=='true')showLightCalibration();observationKey='';dirty=true;});
- $('exposure').addEventListener('input',()=>{objectExposure=false;observationKey='';dirty=true;});
- $('resetExposure').addEventListener('click',()=>{$('exposure').value='0';objectExposure=false;observationKey='';dirty=true;});
- $('population').addEventListener('change',reset);
- $('simulationTab').addEventListener('click',()=>showTab('simulation'));$('objectTab').addEventListener('click',()=>showTab('object'));$('advancedTab').addEventListener('click',()=>showTab('advanced'));$('newSimulationToggle').addEventListener('click',()=>$('newSimulationDialog').showModal());for(const id of ['closeNewSimulation','doneNewSimulation'])$(id).addEventListener('click',()=>$('newSimulationDialog').close());$('rateSlider').addEventListener('input',()=>{const t=Number($('rateSlider').value)/1000,seconds=10**(-9+t*(Math.log10(Number(rateCeiling)/1e9)+9));mode('rate');if(t===1){clock.configureRate(rateCeiling,1n);$('speedValue').value=displayRatio(clock.quantity($('speedUnit').value));}else if(t===0){clock.configureRate(1n,1n);$('speedUnit').value='ns';$('speedValue').value='1';}else{$('speedUnit').value='s';$('speedValue').value=seconds.toPrecision(12);}speedChanged();});
- for(const id of ['localDynamics','localGuard'])$(id).addEventListener('change',()=>{observationKey='';dirty=true;});
- $('findMaterial').addEventListener('click',()=>{if(solar.active&&(/^\d+$/.test($('materialId').value.trim())||$('materialId').value.includes('/system/')||$('materialId').value===solar.active.system.starId)){findSolarBody();return;}try{leaveSolar();const p=resolveMatter($('materialId').value,galacticOffset());stopTracking();selected=p.id;showTab('object');camera.x=p.x;camera.y=p.y;changeZoom(camera.zoom);observationKey='';$('lookupStatus').textContent='';}catch(e){$('lookupStatus').textContent=e.message;}});
- $('closeStar').addEventListener('click',()=>{selected=null;$('starCard').hidden=true;$('starHint').hidden=false;showTab('simulation');dirty=true;});
- $('centerStar').addEventListener('click',()=>{if(solar.active){solarTracked=null;Object.assign(solarTrackingPan,{x:0,y:0});const p=selected?solarScenePoint(selected):{x:0,y:0};solarCamera.x=p.x;solarCamera.y=p.y;dirty=true;return;}if(selected){stopTracking();const p=resolveMatter(selected,galacticOffset());camera.x=p.x;camera.y=p.y;changeZoom(camera.zoom);}});
- $('trackStar').addEventListener('click',()=>{if(!selected)return;if(solar.active&&selected!==solar.active.system.starId){$('referenceId').value=selected;requestReference();return;}if(solar.active){Object.assign(solarTrackingPan,{x:0,y:0});solarTracked=solarTracked===selected?null:selected;solarSelected=null;dirty=true;return;}if(trackedId===selected)stopTracking();else{Object.assign(trackingPan,{x:0,y:0});trackedId=selected;updateTracking();changeZoom(camera.zoom);}dirty=true;});
- $('meterStar').addEventListener('click',exposeForStar);
- $('inspectSurface').addEventListener('click',()=>{if(!selected||!grid)return;if(solar.active&&selected===solar.active.system.starId){inspectSolarBody(solar.active.system.starId);return;}if(solar.active)leaveSolar();Object.assign(trackingPan,{x:0,y:0});trackedId=selected;updateTracking();const R=stellarProperties(selected).radius*StellarPopulation.solarRadiusPc;changeZoom(2*grid.extent*lengthPc()/(2*Math.tan(camera.fovDegrees*Math.PI/360)*10*R));exposeForStar();});
- $('visitSystem').addEventListener('click',visitSelectedSystem);
- $('systemOverview').addEventListener('click',solarOverview);
- $('leaveSystem').addEventListener('click',()=>{leaveSolar();changeZoom(solarFullWidthAU()/30000);});
- for(const id of ['planetaryEnabled','systemAsteroids','systemMask','systemGuides'])$(id).addEventListener('change',()=>{observationKey='';dirty=true;});
- $('trackSystemBody').addEventListener('click',()=>{if(solarSelected){Object.assign(solarTrackingPan,{x:0,y:0});solarTracked=solarTracked===solarSelected?null:solarSelected;updateSolarTracking();dirty=true;}});
- $('inspectSystemBody').addEventListener('click',()=>{if(solarSelected)inspectSolarBody(solarSelected);});
- $('systemHost').addEventListener('click',()=>{if(!solar.active)return;Object.assign(solarTrackingPan,{x:0,y:0});solarSelected=null;selected=solar.active.system.starId;solarTracked=selected;updateStarCard();updateSolarCard();showTab('object');dirty=true;});
- function findSolarBody(){try{if(!solar.active)throw Error('Ouvrir d’abord le système d’une étoile.');const raw=$('materialId').value.trim(),id=/^\d+$/.test(raw)?solar.active.system.prefix+'/body/'+BigInt(raw):raw;PlanetarySystems.body(solar.active.system,id);solarSelected=id===solar.active.system.starId?null:id;solarTracked=id;Object.assign(solarTrackingPan,{x:0,y:0});const p=solar.resolve(id,solarOffsetYear());solarCamera.x=p.x;solarCamera.y=p.y;showTab('object');$('lookupStatus').textContent='';dirty=true;}catch(error){$('lookupStatus').textContent=error.message;}}
- $('materialId').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();$('findMaterial').click();}});
- $('stopTracking').addEventListener('click',stopTracking);
- $('followStar').addEventListener('click',()=>{const p=selected?resolveMatter(selected,galacticOffset()):lightStats?.drawn[0]||points[0]||materials.sample({...camera,budget:1,offset:galacticOffset()}).points[0];if(p){stopTracking();selected=p.id;showTab('object');$('materialId').value=p.id;camera.x=p.x;camera.y=p.y;changeZoom(camera.zoom*4);}});
- let canvas=$('continuous');function screenShape(size=null){const box=canvas.getBoundingClientRect?.()||{};return viewportGeometry(box.width||600,box.height||600,{pixelRatio:globalThis.devicePixelRatio||1,size,maxDimension:gpuLightRenderer?.device?.limits?.maxTextureDimension2D||8192});}
- const world=event=>{const r=canvas.getBoundingClientRect(),v=presentedView||viewFrame(),ctx=presentedContext||viewContext(),x=v.x+(event.clientX-r.left-r.width/2)*ctx.worldPerCssPixel,y=v.y+(r.height/2-event.clientY+r.top)*ctx.worldPerCssPixel;if(v.space==='system'&&solar.active&&v.referenceId===solar.active.system.starId)return{x,y};if(v.space==='galaxy'&&!solar.active)return{x:v.originX+x,y:v.originY+y};const px=v.originX*lengthPc()+x*v.unitPc,py=v.originY*lengthPc()+y*v.unitPc;if(solar.active){const host=resolveMatter(solar.active.system.starId);return{x:(px-host.x*lengthPc())/PlanetarySystems.AU_PC,y:(py-host.y*lengthPc())/PlanetarySystems.AU_PC};}return{x:px/lengthPc(),y:py/lengthPc()};};
- function bindCameraCanvas(canvas){
- canvas.addEventListener('wheel',event=>{event.preventDefault();if(loading||!grid)return;requestZoom((event.deltaY>0?camera.zoom:(zoomMotion.active?zoomMotion.target:camera.zoom))*Math.exp(-event.deltaY*.002),world(event));},{passive:false});
- canvas.addEventListener('mousedown',event=>{if(event.button===1)event.preventDefault();});
- canvas.addEventListener('auxclick',event=>{if(event.button===1)event.preventDefault();});
- canvas.addEventListener('pointerdown',event=>{if(loading||!grid||(renderCamera&&renderCamera.space!==(solar.active?'system':'galaxy'))||(event.button!==undefined&&event.button!==0&&event.button!==1))return;if(event.button===1)event.preventDefault();zoomMotion.cancel(camera.zoom);const pan=solar.active?solarTrackingPan:trackingPan;drag={button:event.button||0,clientX:event.clientX,clientY:event.clientY,x:solar.active?solarCamera.x:camera.x,y:solar.active?solarCamera.y:camera.y,panX:pan.x,panY:pan.y,context:viewContext(),moved:false};canvas.setPointerCapture?.(event.pointerId);});
- canvas.addEventListener('pointermove',event=>{if(!drag||loading||!grid)return;const r=canvas.getBoundingClientRect(),width=solar.active?solarWidthAU():2*grid.extent/camera.zoom,dx=event.clientX-drag.clientX,dy=event.clientY-drag.clientY;drag.moved ||= Math.abs(dx)+Math.abs(dy)>3;if(!drag.moved)return;
-  if(drag.button===1&&(solar.active?solarTracked:trackedId)){const pan=solar.active?solarTrackingPan:trackingPan;pan.x=drag.panX-dx*drag.context.worldPerCssPixel;pan.y=drag.panY+dy*drag.context.worldPerCssPixel;updateTracking();observationKey='';dirty=true;return;}
-  if(solar.active){solarTracked=null;Object.assign(solarTrackingPan,{x:0,y:0});solarCamera.x=drag.x-dx*drag.context.worldPerCssPixel;solarCamera.y=drag.y+dy*drag.context.worldPerCssPixel;observationKey='';dirty=true;return;}stopTracking();camera.x=Math.max(-grid.extent,Math.min(grid.extent,drag.x-dx*drag.context.worldPerCssPixel));camera.y=Math.max(-grid.extent,Math.min(grid.extent,drag.y+dy*drag.context.worldPerCssPixel));cameraControls();});
- canvas.addEventListener('pointerup',event=>{if(!drag)return;const middle=drag.button===1,moved=drag.moved;drag=null;if(moved||loading||!grid)return;const target=world(event);
-  if(solar.active){const picked=pickSolar(target);if(middle&&picked){if(picked.stellarNeighbor){$('referenceId').value=picked.id;requestReference();return;}solarTracked=picked.id;Object.assign(solarTrackingPan,{x:0,y:0});updateSolarTracking();dirty=true;}return;}
-  const width=presentedView?.width??viewContext(camera,false).worldSpan,r=canvas.getBoundingClientRect();let best=Infinity,picked=null;for(const p of lightStats?.drawn||[]){const d=((p.x-target.x)/width*Math.max(r.width,r.height))**2+((p.y-target.y)/width*Math.max(r.width,r.height))**2,hitRadius=Math.max(12,p.radiusPixels/(renderFrameContext?.pixelSpan??canvas.width)*(renderCamera.width/width)*(presentedContext?.cssSpan??Math.max(r.width,r.height)));if(d<=hitRadius*hitRadius&&d<best){best=d;picked=p;}}
-  if(picked){selected=picked.id;showTab('object');$('materialId').value=selected;if(middle){trackedId=selected;Object.assign(trackingPan,{x:0,y:0});updateTracking();}updateStarCard();dirty=true;}
- });
- canvas.addEventListener('pointercancel',()=>{drag=null;});
- }
- bindCameraCanvas(canvas);
- let viewportSignature='',renderSizeDirty=false;const resizeViewport=()=>{const shape=screenShape(),key=shape.aspectX+':'+shape.aspectY+':'+shape.size;if(key!==viewportSignature){viewportSignature=key;observationKey='';dirty=true;renderSizeDirty=true;}};if(globalThis.ResizeObserver)new ResizeObserver(resizeViewport).observe(canvas.parentElement);globalThis.addEventListener?.('resize',resizeViewport);
- $('toggleFullscreen').addEventListener('click',async()=>{try{if(document.fullscreenElement)await document.exitFullscreen();else await canvas.parentElement.requestFullscreen();}catch(error){$('toggleFullscreen').title='Plein écran indisponible : '+error.message;}});document.addEventListener?.('fullscreenchange',()=>{const active=!!document.fullscreenElement;$('toggleFullscreen').textContent=active?'⛶ Quitter le plein écran':'⛶ Plein écran';$('toggleFullscreen').setAttribute('aria-pressed',String(active));resizeViewport();});
+  let scale = 1,
+    initialL = 0,
+    lastCost = 0,
+    lastWall = performance.now(),
+    lastObserveCost = 0,
+    lastRenderCost = 0,
+    lastSteps = 0,
+    lastAdvanced = 0,
+    detailWeight = 0;
+  let stellarPoints = [],
+    stellarProjection = null,
+    stellarSampleInfo = null,
+    stellarDetail = 0;
+  let diagnostics,
+    points = [],
+    sampleInfo = null,
+    phaseCache = null,
+    phaseKey = "",
+    observationKey = "";
+  let lastObservation = 0,
+    rateStamp = performance.now(),
+    rateAnchor = 0n,
+    actualRate = 0,
+    dirty = true,
+    selected = null,
+    trackedId = null,
+    drag = null,
+    rateError = "",
+    photometricFilter = null,
+    objectExposure = false,
+    lastSampleZoom = 0,
+    retentionMode = "none",
+    retainedCount = 0;
+  const angular = (b) =>
+    b.reduce((s, p) => s + p.mass * (p.x * p.vy - p.y * p.vx), 0);
+  const number = (x) =>
+    Math.abs(x) >= 0.001 && Math.abs(x) < 1e6
+      ? x.toPrecision(4)
+      : x.toExponential(3);
+  const lengthPc = () => (calibration ? calibration.lengthKpc * 1000 : 10000);
+  function galacticOffset() {
+    return clock.fineOffset() + Number(solarLagNs) / Number(MODEL_NS);
+  }
+  function solarFullWidthAU() {
+    return (2 * grid.extent * lengthPc()) / PlanetarySystems.AU_PC;
+  }
+  function solarWidthAU() {
+    return solarFullWidthAU() / camera.zoom;
+  }
+  function viewContext(
+    view = camera,
+    local = !!solar.active,
+    viewport = screenShape(),
+  ) {
+    return renderContext(viewport, {
+      worldShortSpan: local ? solarWidthAU() : (2 * grid.extent) / view.zoom,
+      fovDegrees: camera.fovDegrees,
+      sigmaCss: stellarOptics.sigma,
+      units: local ? "AU" : "model",
+      lengthPc: local ? PlanetarySystems.AU_PC : lengthPc(),
+    });
+  }
+  function imageContext(field = projection) {
+    const local = observationCamera?.space === "system";
+    return renderContext(screenShape(), {
+      worldShortSpan: field.cameraWidth ?? field.width,
+      worldSpan: field.width,
+      fovDegrees: field.fovDegrees ?? camera.fovDegrees,
+      sigmaCss: stellarOptics.sigma,
+      units: local ? "AU" : "model",
+      lengthPc: local ? PlanetarySystems.AU_PC : lengthPc(),
+    });
+  }
+  function inCurrentGalaxyView(point) {
+    const c = viewContext(camera, false);
+    return (
+      Math.abs(point.x - camera.x) <= c.worldWidth / 2 &&
+      Math.abs(point.y - camera.y) <= c.worldHeight / 2
+    );
+  }
+  function solarOffsetYear() {
+    return clock.fineOffset() * 1e6;
+  }
+  function leaveSolar() {
+    if (!solar.active) return;
+    const host = resolveMatter(solar.active.system.starId);
+    trackingPan.x = (solarCamera.x * PlanetarySystems.AU_PC) / lengthPc();
+    trackingPan.y = (solarCamera.y * PlanetarySystems.AU_PC) / lengthPc();
+    camera.x = host.x + trackingPan.x;
+    camera.y = host.y + trackingPan.y;
+    Object.assign(solarTrackingPan, { x: 0, y: 0 });
+    solar.deactivate();
+    solarSelected = solarTracked = null;
+    $("systemOverlay").setAttribute("hidden", "");
+    $("systemBodyCard").hidden = true;
+    $("systemMask").checked = solarSavedMask;
+    clock.minimumStep = MIN_MODEL_STEP;
+    observationKey = "";
+    dirty = true;
+    cameraControls();
+  }
+  async function prepareSolar() {
+    if (!$("planetaryEnabled").checked || !grid.isGPU || !gpuLightRenderer) {
+      leaveSolar();
+      return false;
+    }
+    const width = solarWidthAU();
+    if (
+      width > 24000 ||
+      (solar.active && Math.hypot(solarCamera.x, solarCamera.y) > 24000)
+    ) {
+      leaveSolar();
+      return false;
+    }
+    let id = solar.active?.system.starId || trackedId || selected;
+    if (!id && width <= 12000) {
+      const candidate = points
+        .filter((p) => String(p.id).split("/").length === 3)
+        .sort(
+          (a, b) =>
+            Math.hypot(a.x - camera.x, a.y - camera.y) -
+            Math.hypot(b.x - camera.x, b.y - camera.y),
+        )[0];
+      id = candidate?.id;
+    }
+    if (!id || (!solar.active && width > 12000)) return false;
+    const host = resolveMatter(id);
+    if (!solar.active && !inCurrentGalaxyView(host)) return false;
+    const entering = !solar.active,
+      inspection =
+        entering &&
+        objectExposure &&
+        width <
+          (40 *
+            stellarProperties(id).radius *
+            StellarPopulation.solarRadiusPc) /
+            PlanetarySystems.AU_PC;
+    // Keep the displayed camera untouched while GPU resources are prepared.
+    setContextSpeed("system");
+    const token = generation,
+      r = await solar.activate(
+        id,
+        clock.integrated,
+        $("systemAsteroids").value === "auto"
+          ? null
+          : Number($("systemAsteroids").value),
+        solarSelected,
+      );
+    if (token !== generation || !r) return false;
+    if (entering) {
+      // Commit from the live view: zoom/pan can change during async activation.
+      const currentHost = resolveMatter(id);
+      if (
+        !$("planetaryEnabled").checked ||
+        solarWidthAU() > 12000 ||
+        !inCurrentGalaxyView(currentHost)
+      ) {
+        solar.deactivate();
+        return false;
+      }
+      solarCamera.x =
+        ((camera.x - currentHost.x) * lengthPc()) / PlanetarySystems.AU_PC;
+      solarCamera.y =
+        ((camera.y - currentHost.y) * lengthPc()) / PlanetarySystems.AU_PC;
+      Object.assign(solarTrackingPan, solarCamera);
+      Object.assign(trackingPan, { x: 0, y: 0 });
+      solarSavedMask = $("systemMask").checked;
+      if (inspection) $("systemMask").checked = false;
+      solarTracked = id;
+      selected = trackedId = id;
+      camera.x = currentHost.x;
+      camera.y = currentHost.y;
+      localDynamics.deactivate(
+        materials.time,
+        "FMM locale active · système planétaire.",
+      );
+      cameraControls();
+    }
+    clock.minimumStep = Math.max(
+      1e-15,
+      Math.min(MIN_MODEL_STEP, r.stepYear / 1e6),
+    );
+    updateSolarTracking();
+    if (inspection) {
+      observeSolar();
+      exposeSolarBody(id);
+    }
+    return true;
+  }
+  function updateSolarTracking() {
+    if (!solar.active || !solarTracked || physicsBusy) return;
+    const p = solar.resolve(solarTracked, solarOffsetYear());
+    const x = p.x + solarTrackingPan.x,
+      y = p.y + solarTrackingPan.y;
+    if (solarCamera.x !== x || solarCamera.y !== y) {
+      solarCamera.x = x;
+      solarCamera.y = y;
+      dirty = true;
+    }
+    updateSolarCard();
+  }
+  function solarZoomLimit(value) {
+    let z = Math.max(1, Math.min(1e21, value));
+    if (!Number.isFinite(z)) return camera.zoom;
+    const id = solarTracked || solarSelected || solar.active.system.starId,
+      p = solar.resolve(id, solarOffsetYear()),
+      R = (p.radiusKm / PlanetarySystems.AU_KM) * 1.05,
+      lateral = Math.hypot(p.x - solarCamera.x, p.y - solarCamera.y);
+    if (lateral < R)
+      z = Math.min(
+        z,
+        solarFullWidthAU() /
+          (2 *
+            Math.tan((camera.fovDegrees * Math.PI) / 360) *
+            Math.sqrt(R * R - lateral * lateral)),
+      );
+    return z;
+  }
+  function stellarAppearance(point, primaryId, widthAU) {
+    if (
+      !$("planetaryEnabled").checked ||
+      !grid?.isGPU ||
+      point.id !== primaryId
+    )
+      return point;
+    const t = Math.max(0, Math.min(1, Math.log(48000 / widthAU) / Math.log(2))),
+      blend = t * t * (3 - 2 * t),
+      base = point.photometry || stellarProperties(point.id),
+      mask = $("systemMask").checked ? 1 - blend : 1;
+    return {
+      ...point,
+      photometry: {
+        ...base,
+        disc: false,
+        glareScale: 1,
+        luminosity: base.luminosity * mask,
+        visibleLuminosity: base.visibleLuminosity * mask,
+      },
+    };
+  }
+  function starInSolarFrame(point, host) {
+    const unit = lengthPc() / PlanetarySystems.AU_PC;
+    return {
+      ...stellarAppearance(point, host.id, solarWidthAU()),
+      x: (point.x - host.x) * unit,
+      y: (point.y - host.y) * unit,
+      stellarNeighbor: true,
+    };
+  }
+  function solarScenePoint(id) {
+    if (
+      id === solar.active.system.starId ||
+      id.startsWith(solar.active.system.prefix + "/")
+    )
+      return solarLightPoint(solar.resolve(id, solarOffsetYear()));
+    return starInSolarFrame(
+      resolveMatter(id),
+      resolveMatter(solar.active.system.starId),
+    );
+  }
+  function solarLightPoint(p) {
+    const s = solar.active.system;
+    if (p.id === s.starId)
+      return stellarAppearance(
+        { ...p, photometry: s.host },
+        s.starId,
+        solarWidthAU(),
+      );
+    const h =
+        solarWidthAU() / (2 * Math.tan((camera.fovDegrees * Math.PI) / 360)),
+      r = Math.max(p.radiusKm / PlanetarySystems.AU_KM, Math.hypot(p.x, p.y)),
+      cameraDistance = Math.hypot(solarCamera.x - p.x, solarCamera.y - p.y, h),
+      cos = Math.max(
+        -1,
+        Math.min(
+          1,
+          (-p.x * (solarCamera.x - p.x) - p.y * (solarCamera.y - p.y)) /
+            (r * cameraDistance),
+        ),
+      ),
+      alpha = Math.acos(cos),
+      phase = (Math.sin(alpha) + (Math.PI - alpha) * Math.cos(alpha)) / Math.PI,
+      reflection =
+        p.albedo *
+        (p.radiusKm / PlanetarySystems.AU_KM / r) ** 2 *
+        Math.max(0, phase);
+    return {
+      ...p,
+      photometry: {
+        disc: true,
+        isSystemBody: true,
+        proximityVisibility: true,
+        radius: p.radiusKm / (StellarPopulation.solarRadiusM / 1000),
+        luminosity: s.host.luminosity * reflection,
+        visibleLuminosity: s.host.visibleLuminosity * reflection,
+        color: p.color.map((c, i) => c * s.host.color[i]),
+        lightAngle: Math.atan2(p.y, -p.x),
+        lightCos: cos,
+      },
+    };
+  }
+  function observeSolar(force = false) {
+    const now = performance.now(),
+      host = resolveMatter(solar.active.system.starId),
+      unit = PlanetarySystems.AU_PC / lengthPc(),
+      view = {
+        ...camera,
+        x: host.x + solarCamera.x * unit,
+        y: host.y + solarCamera.y * unit,
+      },
+      key = stellarKey(view, host.id);
+    if (
+      !stellarProjection ||
+      (key !== observationKey && (force || now - lastObservation >= 33))
+    )
+      observeStellar(view, host.id, key, now);
+    const ctx = viewContext(),
+      width = ctx.worldSpan,
+      base = stellarProjection;
+    projection = {
+      ...base,
+      width,
+      cameraWidth: ctx.worldShortSpan,
+      fovDegrees: camera.fovDegrees,
+      pixel: width / base.resolution,
+      left: solarCamera.x - width / 2,
+      bottom: solarCamera.y - width / 2,
+      centerX: solarCamera.x,
+      centerY: solarCamera.y,
+      zoom: camera.zoom,
+    };
+    const background = stellarPoints
+      .filter((p) => p.id !== host.id)
+      .map((p) => starInSolarFrame(resolveMatter(p.id), host));
+    const entries = solar.points(solarOffsetYear());
+    observationSolarScene = { hostId: host.id, entries };
+    if (solarSelected && !solar.active.byId.has(solarSelected))
+      observationSolarScene.extra = solar.resolve(
+        solarSelected,
+        solarOffsetYear(),
+      );
+    points = [
+      ...background,
+      ...entries
+        .filter((p) => !$("systemMask").checked || p.id !== host.id)
+        .map(solarLightPoint),
+    ];
+    sampleInfo = stellarSampleInfo;
+    detailWeight = stellarDetail;
+    observationCamera = viewFrame(projection);
+    observationRevision++;
+    dirty = true;
+  }
+  function exposeSolarBody(id) {
+    if (!solar.active) return;
+    observeSolar();
+    const p = solarScenePoint(id),
+      source = lightPlan(projection, [p], {
+        population: materials.population,
+        gain: lightGain,
+        lengthPc: PlanetarySystems.AU_PC,
+        normalizationLengthPc: lengthPc(),
+        fovDegrees: camera.fovDegrees,
+        context: imageContext(),
+      }).candidates[0];
+    if (source && source.peak > 0)
+      $("exposure").value = String(
+        Math.max(-80, Math.min(48, Math.log2(0.4 / source.peak))),
+      );
+    objectExposure = true;
+    dirty = true;
+  }
+  function inspectSolarBody(id) {
+    Object.assign(solarTrackingPan, { x: 0, y: 0 });
+    const p = solar.resolve(id, solarOffsetYear());
+    solarTracked = id;
+    solarSelected = id === solar.active.system.starId ? null : id;
+    if (id === solar.active.system.starId) $("systemMask").checked = false;
+    updateSolarTracking();
+    changeZoom(
+      solarFullWidthAU() / ((12 * p.radiusKm) / PlanetarySystems.AU_KM),
+    );
+    exposeSolarBody(id);
+    showTab("object");
+  }
+  function solarOverview() {
+    if (!solar.active) return;
+    Object.assign(solarTrackingPan, { x: 0, y: 0 });
+    solarTracked = solar.active.system.starId;
+    solarCamera.x = solarCamera.y = 0;
+    changeZoom(solarFullWidthAU() / (2.8 * solar.active.system.extent));
+    dirty = true;
+  }
+  function visitSelectedSystem() {
+    if (solar.active && selected && selected !== solar.active.system.starId)
+      leaveSolar();
+    Object.assign(trackingPan, { x: 0, y: 0 });
+    Object.assign(solarTrackingPan, { x: 0, y: 0 });
+    const p = selected
+      ? resolveMatter(selected)
+      : points.find((p) => String(p.id).split("/").length === 3) ||
+        materials.sample({ ...camera, budget: 1, offset: galacticOffset() })
+          .points[0];
+    if (!p) return;
+    selected = trackedId = p.id;
+    camera.x = p.x;
+    camera.y = p.y;
+    const s = PlanetarySystems.describe(p.id);
+    changeZoom(solarFullWidthAU() / (2.8 * s.extent));
+    showTab("object");
+    observationKey = "";
+    dirty = true;
+  }
+  function pickSolar(target) {
+    const width = presentedView?.width ?? viewContext().worldSpan,
+      size = presentedContext?.cssSpan ?? screenShape().cssSpan,
+      selectable = new Set((lightStats?.sources || []).map((p) => p.id));
+    if ($("systemGuides").checked)
+      for (const id of solarGuideIds) selectable.add(id);
+    if (solarSelected) selectable.add(solarSelected);
+    let best = Infinity,
+      choice = null;
+    for (const p of [
+      ...(frames.current?.points || []),
+      ...(frames.current?.solarScene?.extra
+        ? [frames.current?.solarScene.extra]
+        : []),
+    ]) {
+      if (!selectable.has(p.id)) continue;
+      const d = (Math.hypot(p.x - target.x, p.y - target.y) / width) * size,
+        r = Math.max(
+          10,
+          ((p.radiusKm || 0) / PlanetarySystems.AU_KM / width) * size,
+        );
+      if (d <= r && d < best) {
+        best = d;
+        choice = p;
+      }
+    }
+    if (choice) {
+      if (choice.stellarNeighbor) {
+        selected = choice.id;
+        solarSelected = null;
+      } else
+        solarSelected =
+          choice.id === solar.active.system.starId ? null : choice.id;
+      showTab("object");
+      updateSolarCard();
+      updateStarCard();
+      dirty = true;
+    }
+    return choice;
+  }
+  function updateSolarCard() {
+    const card = $("systemBodyCard");
+    card.hidden = !solar.active || !solarSelected;
+    if (card.hidden) return;
+    const p = solar.resolve(solarSelected, solarOffsetYear()),
+      anchor = solarTracked
+        ? solar.resolve(solarTracked, solarOffsetYear())
+        : null;
+    card.setAttribute("data-id", p.id);
+    $("starCard").hidden = true;
+    $("starHint").hidden = true;
+    $("systemBodyName").textContent = p.name;
+    if (document.activeElement !== $("materialId"))
+      $("materialId").value = p.id;
+    $("systemBodyKind").textContent = p.kind;
+    $("systemBodyId").value = p.id;
+    $("systemBodyMass").textContent = PlanetarySystems.formatMass(p.mass);
+    $("systemBodyRadius").textContent = number(p.radiusKm) + " km";
+    $("systemBodyPosition").textContent =
+      "x=" + p.x.toPrecision(14) + " · y=" + p.y.toPrecision(14) + " UA";
+    $("systemBodyPosition").setAttribute("data-x", String(p.x));
+    $("systemBodyPosition").setAttribute("data-y", String(p.y));
+    $("systemBodyVelocity").textContent =
+      number(Math.hypot(p.vx, p.vy) * PlanetarySystems.AU_YEAR_KMS) + " km/s";
+    $("systemBodyRelative").textContent = anchor
+      ? "Δx=" +
+        number(p.x - anchor.x) +
+        " · Δy=" +
+        number(p.y - anchor.y) +
+        " UA · Δv=" +
+        number(
+          Math.hypot(p.vx - anchor.vx, p.vy - anchor.vy) *
+            PlanetarySystems.AU_YEAR_KMS,
+        ) +
+        " km/s"
+      : "Référentiel de l’étoile";
+    $("trackSystemBody").textContent =
+      solarTracked === p.id ? "Arrêter le suivi" : "Suivre cet objet";
+  }
+  function updateSolarStatus() {
+    const r = solar.active;
+    $("lookupLabel").textContent = r
+      ? "Identité du corps ou rang"
+      : "Identité de l’étoile";
+    $("formationStatus").textContent = r
+      ? "Matière initiale : " +
+        PlanetarySystems.formatMass(r.system.formation.initialMass) +
+        " · condensée : " +
+        PlanetarySystems.formatMass(r.system.formation.compactMass) +
+        " · résiduelle : " +
+        PlanetarySystems.formatMass(r.system.formation.residualMass) +
+        ". " +
+        r.system.seeds.length +
+        " concentrations condensées."
+      : "";
+    $("galaxyObservation").hidden = false;
+    $("systemObservation").hidden = !r;
+    $("viewTitle").textContent = r
+      ? "SYSTÈME DE " + stellarName(r.system.starId)
+      : "DU CHAMP GALACTIQUE AUX ÉTOILES";
+    if (r)
+      $("systemHost").textContent = "Revenir à " + stellarName(r.system.starId);
+    $("visitSystem").disabled = !grid?.isGPU || !gpuLightRenderer;
+    $("systemStatus").textContent = r
+      ? "Système de " +
+        stellarName(r.system.starId) +
+        " · " +
+        r.system.seeds.filter(
+          (p) => PlanetarySystems.classifyMass(p.mass) !== "Astéroïde",
+        ).length +
+        " planètes · " +
+        r.system.defaultCount.toLocaleString("fr-FR") +
+        " corps matérialisés par défaut · " +
+        r.system.smallCount.toLocaleString("fr-FR") +
+        " identités inférées · " +
+        r.states.length +
+        " corps intégrés · FMM GPU " +
+        r.lastMs.toFixed(1) +
+        " ms."
+      : !grid?.isGPU || !gpuLightRenderer
+        ? "Le détail planétaire demande la physique et le rendu WebGPU."
+        : "Zoomer vers une étoile ou utiliser « Voir le système ».";
+    if (r) {
+      $("localCount").textContent = r.states.length + " corps du système · GPU";
+      $("localCount").setAttribute("data-count", String(r.states.length));
+      $("localCount").setAttribute("data-backend", "GPU");
+      $("localStatus").textContent =
+        "FMM locale active · système planétaire unique.";
+      $("trackingStatus").textContent = solarTracked
+        ? "Référentiel suivi : " + solar.resolve(solarTracked).name
+        : "Caméra libre dans le référentiel de l’étoile";
+    }
+  }
+  function updateSolarOverlay(view, shape) {
+    const overlay = $("systemOverlay");
+    const hidden =
+      view.space !== "system" ||
+      !solar.active ||
+      frames.current?.solarScene?.hostId !== solar.active.system.starId ||
+      !$("systemGuides").checked;
+    overlay.toggleAttribute("hidden", hidden);
+    solarGuideIds.clear();
+    solarGPUguides = [];
+    if (hidden) return;
+    const width = view.width,
+      cx = view.x,
+      cy = view.y,
+      px = (x) => shape.cssWidth / 2 + ((x - cx) / width) * shape.cssSpan,
+      py = (y) => shape.cssHeight / 2 - ((y - cy) / width) * shape.cssSpan;
+    overlay.setAttribute(
+      "viewBox",
+      "0 0 " + shape.cssWidth + " " + shape.cssHeight,
+    );
+    overlay.style.width = shape.cssWidth + "px";
+    overlay.style.height = shape.cssHeight + "px";
+    let markup = "";
+    for (const p of solar.active.system.seeds) {
+      const rx = (p.a / width) * shape.cssSpan;
+      if (rx > 10000) continue;
+      const x = px(-p.a * p.e * Math.cos(p.omega)),
+        y = py(-p.a * p.e * Math.sin(p.omega));
+      markup +=
+        '<ellipse cx="' +
+        x +
+        '" cy="' +
+        y +
+        '" rx="' +
+        rx +
+        '" ry="' +
+        rx * Math.sqrt(1 - p.e * p.e) +
+        '" transform="rotate(' +
+        (-p.omega * 180) / Math.PI +
+        " " +
+        x +
+        " " +
+        y +
+        ')" fill="none" stroke="#8a9aa2" stroke-opacity=".18" stroke-width=".6"/>';
+    }
+    const featured = new Set([
+        solar.active.system.starId,
+        ...solar.active.system.seeds.map((p) => p.id),
+        solarSelected,
+      ]),
+      entries = frames.current?.solarScene.entries;
+    const drawGuide = (p, worldX = p.x, worldY = p.y) => {
+      const isSelected = p.id === (solarSelected || selected),
+        g = systemBodyGuide(p.radiusKm, width, {
+          selected: isSelected,
+          context: shape,
+        }),
+        x = px(worldX),
+        y = py(worldY);
+      if (
+        g.opacity <= 0.01 ||
+        g.radius > shape.cssSpan ||
+        x + g.ringRadius < 0 ||
+        x - g.ringRadius > shape.cssWidth ||
+        y + g.ringRadius < 0 ||
+        y - g.ringRadius > shape.cssHeight
+      )
+        return;
+      solarGuideIds.add(p.id);
+      if (!featured.has(p.id)) {
+        solarGPUguides.push({
+          id: p.id,
+          x,
+          y,
+          radius: g.ringRadius,
+          opacity: g.opacity,
+        });
+        return;
+      }
+      markup +=
+        '<circle data-body-id="' +
+        p.id +
+        '" cx="' +
+        x +
+        '" cy="' +
+        y +
+        '" r="' +
+        g.ringRadius +
+        '" fill="none" stroke="' +
+        (isSelected ? "#ff5050" : "#9caeb6") +
+        '" stroke-opacity="' +
+        g.opacity +
+        '" stroke-width=".7" stroke-dasharray="2 2"/>';
+      if (p.kind !== "Astéroïde" || isSelected)
+        markup +=
+          '<text x="' +
+          (x + g.ringRadius + 4) +
+          '" y="' +
+          (y - 5) +
+          '" fill="#aabac1" opacity="' +
+          g.opacity +
+          '" font-size="8">' +
+          p.name +
+          "</text>";
+    };
+    // Cull by immutable radius before resolving positions; no extra orbit/body
+    // population is inferred for guides. Numerous minor-body rings use one GPU draw.
+    for (const p of entries) {
+      if (
+        !featured.has(p.id) &&
+        (p.radiusKm / PlanetarySystems.AU_KM / width) * shape.cssSpan <= 0.0001
+      )
+        continue;
+      if (featured.has(p.id)) {
+        drawGuide(p);
+        continue;
+      }
+      const x = p.x,
+        y = p.y;
+      if (
+        Math.abs(x - cx) > shape.worldWidth * 0.51 ||
+        Math.abs(y - cy) > shape.worldHeight * 0.51
+      )
+        continue;
+      drawGuide(p, x, y);
+    }
+    if (frames.current?.solarScene.extra?.id === solarSelected)
+      drawGuide(frames.current?.solarScene.extra);
+    overlay.setAttribute("data-guide-count", String(solarGuideIds.size));
+    overlay.setAttribute("data-gpu-guide-count", String(solarGPUguides.length));
+    overlay.innerHTML = markup;
+  }
+  const cameraHeight = () =>
+    solar.active
+      ? solarWidthAU() / (2 * Math.tan((camera.fovDegrees * Math.PI) / 360))
+      : (2 * (grid?.extent || physics.extent) * lengthPc()) /
+        camera.zoom /
+        (2 * Math.tan((camera.fovDegrees * Math.PI) / 360));
+  function cameraControls() {
+    if (grid) {
+      $("cameraHeightLabel").textContent = solar.active
+        ? "Hauteur au-dessus du plan (UA)"
+        : "Distance au plan stellaire (pc)";
+      $("zoomSlider").max = String(Math.log2(solar.active ? 1e21 : 1e12));
+      $("zoomValue").max = String(solar.active ? 1e21 : 1e12);
+    }
+    $("zoomValue").value = (
+      zoomMotion.active ? zoomMotion.target : camera.zoom
+    ).toPrecision(6);
+    $("zoomSlider").value = Math.log2(
+      zoomMotion.active ? zoomMotion.target : camera.zoom,
+    );
+    $("centerX").value = camera.x.toPrecision(17);
+    $("centerY").value = camera.y.toPrecision(17);
+    if (document.activeElement !== $("cameraHeight"))
+      $("cameraHeight").value = cameraHeight().toPrecision(8);
+    dirty = true;
+  }
+  function stopTracking() {
+    Object.assign(trackingPan, { x: 0, y: 0 });
+    Object.assign(solarTrackingPan, { x: 0, y: 0 });
+    solarTracked = null;
+    trackedId = null;
+    displayAnchor = null;
+    dirty = true;
+  }
+  function updateTracking() {
+    if (solar.active) updateSolarTracking();
+    if (!trackedId || !materials || physicsBusy) return;
+    const p = resolveMatter(trackedId, galacticOffset());
+    displayAnchor = p;
+    const x = p.x + trackingPan.x,
+      y = p.y + trackingPan.y;
+    if (camera.x !== x || camera.y !== y) {
+      camera.x = x;
+      camera.y = y;
+      cameraControls();
+    }
+    updateStarCard();
+  }
+  function limitZoom(value) {
+    if (solar.active) return solarZoomLimit(value);
+    let z = Math.max(1, Math.min(1e12, value));
+    if (!Number.isFinite(z)) return camera.zoom;
+    const targetId = trackedId || selected;
+    if (targetId && materials && grid) {
+      const p = resolveMatter(targetId, galacticOffset()),
+        R =
+          stellarProperties(targetId).radius *
+          StellarPopulation.solarRadiusPc *
+          1.05,
+        lateral = Math.hypot(p.x - camera.x, p.y - camera.y) * lengthPc();
+      if (lateral < R) {
+        const limit =
+          (2 * grid.extent * lengthPc()) /
+          (2 *
+            Math.tan((camera.fovDegrees * Math.PI) / 360) *
+            Math.sqrt(R * R - lateral * lateral));
+        z = Math.min(z, limit);
+      }
+    }
+    return z;
+  }
+  function applyZoom(z, anchor = null) {
+    if (solar.active && anchor && !solarTracked) {
+      const ratio = camera.zoom / z;
+      solarCamera.x = anchor.x + (solarCamera.x - anchor.x) * ratio;
+      solarCamera.y = anchor.y + (solarCamera.y - anchor.y) * ratio;
+    }
+    if (anchor && !solar.active && !trackedId) {
+      const ratio = camera.zoom / z;
+      camera.x = anchor.x + (camera.x - anchor.x) * ratio;
+      camera.y = anchor.y + (camera.y - anchor.y) * ratio;
+    }
+    camera.zoom = z;
+    cameraControls();
+  }
+  function changeZoom(value, anchor = null) {
+    const z = limitZoom(value);
+    zoomMotion.cancel(z);
+    applyZoom(z, anchor);
+  }
+  function requestZoom(value, anchor = null) {
+    const z = limitZoom(value);
+    if (z < camera.zoom) {
+      changeZoom(z, anchor);
+      observationKey = "";
+      dirty = true;
+    } else {
+      zoomMotion.to(z, performance.now(), anchor);
+      cameraControls();
+    }
+  }
+  function exposeForStar() {
+    if (solar.active) {
+      exposeSolarBody(solarSelected || selected || solar.active.system.starId);
+      return;
+    }
+    if (!selected || !grid) return;
+    const p = resolveMatter(selected, galacticOffset()),
+      ctx = viewContext(camera, false),
+      width = ctx.worldSpan,
+      view = {
+        width,
+        cameraWidth: ctx.worldShortSpan,
+        pixel: width,
+        left: camera.x - width / 2,
+        bottom: camera.y - width / 2,
+        centerX: camera.x,
+        centerY: camera.y,
+        resolution: 1,
+        image: new Float64Array(1),
+        mass: 0,
+        expected: 0,
+      };
+    const source = lightPlan(view, [p], {
+      population: materials.population,
+      gain: lightGain,
+      context: ctx,
+      lengthPc: lengthPc(),
+      fovDegrees: camera.fovDegrees,
+    }).candidates[0];
+    if (!source) return;
+    const target = source.photosphereResolved ? 0.4 : 12;
+    $("exposure").value = Math.max(
+      -80,
+      Math.min(16, Math.round(Math.log2(target / source.peak) * 4) / 4),
+    );
+    objectExposure = true;
+    observationKey = "";
+    dirty = true;
+  }
+  async function reset() {
+    pendingReference = null;
+    referenceSequence++;
+    referenceDraft = false;
+    referenceError = "";
+    referenceLastId = "";
+    solar.destroy();
+    Object.assign(trackingPan, { x: 0, y: 0 });
+    Object.assign(solarTrackingPan, { x: 0, y: 0 });
+    solarLagNs = 0n;
+    solarSelected = solarTracked = null;
+    $("systemOverlay").setAttribute("hidden", "");
+    $("systemBodyCard").hidden = true;
+    const token = ++generation;
+    loading = true;
+    physicsBusy = false;
+    displayAnchor = null;
+    gpuLightRenderer?.destroy();
+    gpuLightRenderer = null;
+    sceneCanvas = document.createElement("canvas");
+    localDynamics?.destroy();
+    grid?.destroy?.();
+    grid = null;
+    running = manual = false;
+    revision = 0;
+    drag = null;
+    zoomMotion.cancel(camera.zoom);
+    frames.clear();
+    observationCamera =
+      presentedView =
+      presentedContext =
+      observationSolarScene =
+        null;
+    observationRevision = 0;
+    if (objectExposure) {
+      $("exposure").value = String(defaultExposure);
+      objectExposure = false;
+    }
+    clock.integrated = clock.debt = clock.remainder = 0n;
+    phaseCache = null;
+    phaseKey = observationKey = "";
+    points = [];
+    stellarPoints = [];
+    stellarProjection = stellarSampleInfo = null;
+    stellarDetail = 0;
+    selected = trackedId = null;
+    lastSampleZoom = 0;
+    retainedCount = 0;
+    retentionMode = "none";
+    photometricFilter = null;
+    localDynamics = new LocalStellarDynamics();
+    $("materialId").value = "";
+    $("selectedStar").textContent = "";
+    $("lookupStatus").textContent = "";
+    $("starCard").hidden = true;
+    $("starHint").hidden = false;
+    showTab("simulation");
+    lastCost =
+      lastObserveCost =
+      lastRenderCost =
+      lastSteps =
+      lastAdvanced =
+      detailWeight =
+        0;
+    rateAnchor = 0n;
+    rateStamp = lastWall = performance.now();
+    actualRate = 0;
+    $("pause").disabled = $("step").disabled = true;
+    $("pause").textContent = "Démarrer";
+    const [n, nv] = $("resolution").value.split(",").map(Number),
+      initial = initialBodies(
+        Number($("count").value),
+        $("scenario").value,
+        417,
+        {
+          softening: Number($("softening").value),
+          structure: Number($("structure").value),
+        },
+      );
+    physics = initial.physics || {
+      gravity: 0.48,
+      softening: Number($("softening").value),
+      haloV2: 0,
+      extent: 1.5,
+      vmax: 2,
+    };
+    calibration = initial.calibration || null;
+    $("populationNotice").textContent =
+      calibration && $("population").value !== "11"
+        ? "Population expérimentale : masses et vitesses MW conservées, mais la densité en nombre n’est plus celle du profil de référence."
+        : "";
+    $("physicalProfile").textContent = calibration
+      ? `Voie lactée simplifiée · 100 milliards d’étoiles · diamètre ${number(calibration.radiusKpc * 2)} kpc (~100 000 al) · disque exponentiel ${calibration.scaleKpc} kpc, barre et bras perturbés (${Math.round(physics.structure * 100)} %). Masse stellaire moyenne ${number(calibration.meanStarMass)} M☉, total ${number(calibration.massMsun)} M☉. Vitesse circulaire de fond à 8,2 kpc : ${number(calibration.solarCircularKmS)} km/s ; moyenne initiale ${number(calibration.meanSpeedKmS)} km/s. Densité du disque moyennée en azimut : ${number(calibration.surfaceSolar)} étoiles/pc² au rayon solaire (~${number(calibration.numberDensitySolar)} étoiles/pc³ avec épaisseur supposée). Dynamique plane + halo lisse ; population de champ synthétique, pas une reconstruction exacte de notre Galaxie.`
+      : "Scénario pédagogique en unités réduites ; échelle optique illustrative de 10 kpc/unité.";
+    $("structureControls").hidden = !calibration;
+    try {
+      if ($("engine").value === "gpu") {
+        $("backendStatus").textContent = "Initialisation WebGPU…";
+        const next = await GPUKineticMatter.create({
+          n,
+          nv,
+          bodies: initial,
+          ...physics,
+          physics: parameters(),
+        });
+        if (token !== generation) {
+          next.destroy();
+          return;
+        }
+        grid = next;
+        grid.isGPU = true;
+        $("backendStatus").textContent =
+          `WebGPU · ${n}² × ${nv}² · ${((grid.size * 12) / 1048576).toFixed(0)} Mio principaux.`;
+      } else {
+        grid = new TVDMatter({
+          n,
+          nv,
+          extent: physics.extent,
+          vmax: physics.vmax,
+        });
+        grid.load(initial);
+        $("backendStatus").textContent = "CPU · FMM et transport TVD.";
+      }
+      if (grid.isGPU) {
+        try {
+          const renderer = await GPUStellarLightRenderer.create({
+            device: grid.device,
+          });
+          if (token !== generation) {
+            renderer.destroy();
+            return;
+          }
+          gpuLightRenderer = renderer;
+        } catch (e) {
+          console.warn("Rendu optique CPU : " + e.message);
+        }
+      }
+      renewDisplayCanvas(!!gpuLightRenderer);
+      lightBackendChanged();
+      solar.setDevice(grid.isGPU ? grid.device : null);
+      materials = new PersistentMatter(grid, {
+        population: 10n ** BigInt($("population").value),
+        seed:
+          $("scenario").value +
+          ":" +
+          $("count").value +
+          ":417" +
+          (calibration ? ":structure=" + physics.structure : ""),
+      });
+      if (grid.isGPU) {
+        try {
+          await localDynamics.attachGPU(grid.device);
+        } catch (e) {
+          localDynamics.gpuFallback = e.message;
+        }
+        if (token !== generation) return;
+      }
+      if (!grid.isGPU) grid.field(parameters());
+      materials.setField(grid.ax, grid.ay);
+      const ownerMaterials = materials,
+        ownerLocal = localDynamics,
+        ownerGrid = grid;
+      grid.onTransport = grid.isGPU
+        ? async ({ dt, ax, ay }) => {
+            if (ownerLocal.active.length) ownerMaterials.setField(ax, ay);
+            await ownerLocal.advance(dt, ownerMaterials, ownerGrid);
+            ownerMaterials.step(dt, ax, ay);
+          }
+        : ({ dt, ax, ay }) => {
+            if (ownerLocal.active.length) ownerMaterials.setField(ax, ay);
+            ownerLocal.advance(dt, ownerMaterials, ownerGrid);
+            ownerMaterials.step(dt, ax, ay);
+          };
+      scale = Math.max(...smooth(grid.mass, n));
+      lightGain = (4 * grid.dx * grid.dx) / scale;
+      refresh();
+      initialL = diagnostics.angularMomentum;
+      cameraControls();
+      await observe(true);
+      if (token !== generation) return;
+      draw();
+    } catch (e) {
+      if (token !== generation) return;
+      if ($("engine").value === "gpu") {
+        $("engine").value = "cpu";
+        $("resolution").value = "28,25";
+        await reset();
+        $("backendStatus").textContent = "Repli CPU : " + e.message;
+      } else
+        $("backendStatus").textContent =
+          "Initialisation impossible : " + e.message;
+    } finally {
+      if (token === generation) {
+        loading = false;
+        $("pause").disabled = $("step").disabled = false;
+        lastWall = performance.now();
+      }
+    }
+  }
+  function smooth(mass, n) {
+    const a = new Float64Array(mass.length),
+      b = new Float64Array(mass.length);
+    for (let y = 0; y < n; y++)
+      for (let x = 0; x < n; x++)
+        a[y * n + x] =
+          (2 * mass[y * n + x] +
+            (x ? mass[y * n + x - 1] : 0) +
+            (x < n - 1 ? mass[y * n + x + 1] : 0)) /
+          4;
+    for (let y = 0; y < n; y++)
+      for (let x = 0; x < n; x++)
+        b[y * n + x] =
+          (2 * a[y * n + x] +
+            (y ? a[(y - 1) * n + x] : 0) +
+            (y < n - 1 ? a[(y + 1) * n + x] : 0)) /
+          4;
+    return b;
+  }
+  function refresh() {
+    diagnostics = grid.diagnostics();
+    dirty = true;
+  }
+  function stellarKey(view, selectedStar) {
+    const shape = screenShape();
+    return [
+      shape.cssSpan,
+      shape.pixelRatio,
+      shape.aspectX,
+      shape.aspectY,
+      revision,
+      view.x,
+      view.y,
+      view.zoom,
+      view.fovDegrees,
+      selectedStar,
+      trackedId,
+      $("exposure").value,
+      lightCalibration.budget,
+      lightCalibration.onset,
+      $("adaptiveSources").checked,
+      $("population").value,
+      galacticOffset(),
+      $("localStars").checked,
+      $("psfWidth").value,
+    ].join(":");
+  }
+  function captureStellar() {
+    observationCamera = viewFrame(projection);
+    observationSolarScene = null;
+    stellarPoints = points;
+    stellarProjection = projection;
+    stellarSampleInfo = sampleInfo;
+    stellarDetail = detailWeight;
+  }
+  function observeStellar(view, selectedStar, key, now) {
+    retentionMode =
+      lastSampleZoom > view.zoom
+        ? "zoom-out"
+        : lastSampleZoom < view.zoom
+          ? "zoom-in"
+          : "steady";
+    retainedCount = 0;
+    const ctx = viewContext(view, false),
+      shape = ctx;
+    view = { ...view, aspectX: shape.aspectX, aspectY: shape.aspectY };
+    const imageZoom = (2 * grid.extent) / ctx.worldSpan,
+      observationOffset = galacticOffset();
+    projection = viewportProjection(
+      projectDensityLight(grid, {
+        ...view,
+        zoom: imageZoom,
+        resolution: view.zoom < 64 ? 192 : 64,
+      }),
+      view.aspectX,
+      view.aspectY,
+    );
+    projection.expected = Number(materials.population) * projection.viewMass;
+    projection.zoom = view.zoom;
+    projection.cameraWidth = ctx.worldShortSpan;
+    projection.fovDegrees = view.fovDegrees;
+    const budget = budgetForProjection(projection),
+      sigma = Math.max(0.5, Math.min(3, stellarOptics.sigma));
+    updateAdaptiveControls();
+    materials.coordinateCacheLimit = Math.max(
+      materials.coordinateCacheLimit,
+      Math.min(1048576, Math.max(32768, budget * 3)),
+    );
+    reserveStellarProperties(budget);
+    detailWeight =
+      budget > lightSourceLimit()
+        ? 0
+        : stellarDetailLevel(
+            projection.expected,
+            budget,
+            lightCalibration.onset,
+          );
+    const minimum =
+      minimumLuminosity(projection, {
+        population: materials.population,
+        gain: lightGain,
+        sigma,
+        exposureEV: Number($("exposure").value),
+        fovDegrees: view.fovDegrees,
+        context: ctx,
+      }) / Math.max(detailWeight, 1e-30);
+    let threshold = minimum,
+      filter = StellarPopulation.luminosityFilter(threshold);
+    for (
+      let i = 0;
+      i < 32 &&
+      projection.expected * filter.fraction > budget * 0.5 &&
+      filter.fraction > 0;
+      i++
+    ) {
+      threshold *= 2;
+      const next = StellarPopulation.luminosityFilter(threshold);
+      if (next.fraction === 0) break;
+      filter = next;
+    }
+    if (!photometricFilter || photometricFilter.key !== filter.key)
+      photometricFilter = filter;
+    if (
+      !$("localStars").checked ||
+      detailWeight === 0 ||
+      filter.fraction === 0
+    ) {
+      points = [];
+      sampleInfo = {
+        points: [],
+        estimated: BigInt(Math.max(0, Math.round(projection.expected))),
+        truncated: false,
+        unresolved: true,
+      };
+      lastSampleZoom = view.zoom;
+      observationKey = key;
+      lastObservation = now;
+      lastObserveCost = performance.now() - now;
+      observationRevision++;
+      dirty = true;
+      captureStellar();
+      return;
+    }
+    sampleInfo = materials.sample({
+      ...view,
+      zoom: imageZoom,
+      budget,
+      offset: observationOffset,
+      rankFilter: photometricFilter,
+      boundaryTolerance: ctx.observationTolerance,
+    });
+    // Preserve visible identities across sampling/LOD changes, in a bounded cache.
+    // Refresh their positions from the same characteristics, not stale snapshots.
+    const half = ctx.worldSpan / 2,
+      geometry = cameraGeometry(projection, {
+        lengthPc: lengthPc(),
+        fovDegrees: view.fovDegrees,
+        context: ctx,
+      }),
+      minimumFlux =
+        (minimum * StellarPopulation.solarFluxAtPc) /
+        (geometry.heightPc * geometry.heightPc),
+      merged = new Map();
+    const prior =
+        retentionMode === "zoom-out"
+          ? []
+          : stellarPoints.map((p) => resolveMatter(p.id, observationOffset)),
+      priorIds = prior.map((p) => p.id);
+    // sample() already evaluated the collective position at this exact offset.
+    // Apply the same local correction directly, then deduplicate before optics.
+    const sampleTime = materials.time + observationOffset,
+      candidates = new Map();
+    for (const p of [
+      ...prior,
+      ...sampleInfo.points.map((p) => localDynamics.correct(p, sampleTime)),
+      ...localDynamics.visible(
+        materials,
+        { ...view, zoom: imageZoom },
+        grid.extent,
+        observationOffset,
+      ),
+    ])
+      candidates.set(p.id, p);
+    for (const point of candidates.values()) {
+      if (
+        Math.abs(point.x - view.x) > half * view.aspectX ||
+        Math.abs(point.y - view.y) > half * view.aspectY
+      )
+        continue;
+      const photometry = point.photometry || stellarProperties(point.id),
+        flux = sourceVisibleFlux(point, geometry, photometry);
+      if (flux < minimumFlux) continue;
+      // Carry immutable birth photometry into rendering; the physical position stays fresh.
+      if (!point.photometry) point.photometry = photometry;
+      merged.set(point.id, { point, flux });
+    }
+    points = selectObservedSources(
+      Array.from(merged.values()),
+      priorIds,
+      budget,
+    );
+    if (selectedStar && budget > 0) {
+      const p = resolveMatter(selectedStar, observationOffset),
+        half = ctx.worldSpan / 2;
+      if (
+        Math.abs(p.x - view.x) <= half * view.aspectX &&
+        Math.abs(p.y - view.y) <= half * view.aspectY &&
+        !points.some((q) => q.id === p.id)
+      ) {
+        if (points.length >= budget) points.pop();
+        points.push(p);
+      }
+    }
+    const previousIds = new Set(priorIds);
+    retainedCount = points.reduce(
+      (count, p) => count + Number(previousIds.has(p.id)),
+      0,
+    );
+    lastSampleZoom = view.zoom;
+    observationKey = key;
+    lastObservation = now;
+    lastObserveCost = performance.now() - now;
+    observationRevision++;
+    dirty = true;
+    captureStellar();
+  }
+  async function observe(force = false) {
+    if (!grid) return;
+    if (await prepareSolar()) {
+      observeSolar(force);
+      return;
+    }
+    const token = generation,
+      now = performance.now(),
+      key = stellarKey(camera, selected);
+    if (key === observationKey || (!force && now - lastObservation < 33))
+      return;
+    await prepareLocal();
+    if (token !== generation) return;
+    updateTracking();
+    observeStellar(camera, selected, stellarKey(camera, selected), now);
+    points = stellarPoints.map((p) =>
+      stellarAppearance(p, trackedId || selected, solarWidthAU()),
+    );
+  }
 
- document.addEventListener?.('visibilitychange',()=>{lastWall=rateStamp=performance.now();rateAnchor=clock.visible();displayFPS.reset();renderFPS.reset();});
- async function frame(timestamp){const token=generation,now=Number.isFinite(timestamp)?timestamp:performance.now(),elapsed=Math.max(0,Math.min(250,now-lastWall));lastWall=now;
-  try{if(!loading&&grid&&!document.hidden){if(pendingReference)await processReference();if(token!==generation)return;if(running&&(solar.active||solarLagNs===0n))clock.tick(elapsed);const requested=(running||manual)?Math.min(clock.duration(grid.isGPU?.1:.025),Number(rateCeiling)/Number(MODEL_NS)*elapsed/1000):0,start=performance.now();
-   if(!solar.active&&solarLagNs>0n){physicsBusy=true;const progress=grid.isGPU?await grid.advance(Math.min(.01,Number(solarLagNs)/Number(MODEL_NS)),parameters()):grid.advance(Math.min(.01,Number(solarLagNs)/Number(MODEL_NS)),parameters());if(token!==generation)return;const consumed=BigInt(Math.round(progress.advanced*Number(MODEL_NS)));solarLagNs=solarLagNs>consumed?solarLagNs-consumed:0n;revision++;lastCost=performance.now()-start;lastSteps=progress.steps;lastAdvanced=progress.advanced;refresh();}
-   else if(solar.active&&requested>0){physicsBusy=true;const before=clock.integrated,progress=await solar.advance(requested*1e6);if(token!==generation)return;clock.consume(progress.advanced/1e6);solarLagNs+=clock.integrated-before;if(solar.active){solar.active.epochNs=clock.integrated;solar.save();}revision++;lastCost=performance.now()-start;lastSteps=progress.steps;lastAdvanced=progress.advanced/1e6;dirty=true;}
-   else if(requested>0){physicsBusy=true;const duration=Math.min(requested,localDynamics?.stepLimit||Infinity),progress=grid.isGPU?await grid.advance(duration,parameters()):grid.advance(duration,parameters());if(token!==generation)return;clock.consume(progress.advanced);revision++;lastCost=performance.now()-start;lastSteps=progress.steps;lastAdvanced=progress.advanced;refresh();}
-   physicsBusy=false;if(manual&&clock.duration()===0){manual=false;$('pause').textContent='Reprendre';}updateTracking();await observe();if(token===generation&&(dirty||running||manual))draw();
-  }}catch(error){if(token===generation){running=manual=false;$('pause').textContent='Reprendre';$('backendStatus').textContent='Calcul arrêté : '+error.message;}}
-  finally{if(token===generation)physicsBusy=false;requestAnimationFrame(frame);}
- }
+  function paint(force = false) {
+    if (!force && frames.current?.revision === observationRevision) return;
+    const renderStarted = performance.now();
+    const complete =
+      !!sampleInfo &&
+      !sampleInfo.unresolved &&
+      !sampleInfo.truncated &&
+      BigInt(solar.active ? stellarPoints.length : points.length) ===
+        sampleInfo.estimated;
+    const ctx = imageContext(),
+      { size, pixelWidth, pixelHeight } = ctx,
+      rasterProjection =
+        projection.aspectX === ctx.aspectX && projection.aspectY === ctx.aspectY
+          ? projection
+          : viewportProjection(projection, ctx.aspectX, ctx.aspectY);
+    (gpuLightRenderer || lightRenderer).resize(pixelWidth, pixelHeight);
+    lightStats = (gpuLightRenderer || lightRenderer).render(
+      gpuLightRenderer ? null : sceneCanvas,
+      rasterProjection,
+      points,
+      {
+        detailWeight,
+        population: materials.population,
+        gain: lightGain,
+        exposureEV: Number($("exposure").value),
+        sigma: ctx.sigmaPixels,
+        context: ctx,
+        complete,
+        selected: solar.active ? solarSelected || selected : selected,
+        glare: stellarOptics.glare,
+        opticalProfile: stellarOptics.profile,
+        spikeAngle: stellarOptics.angle,
+        opticalShape: stellarOptics.shape,
+        stellarFade: stellarOptics.fade,
+        lengthPc: ctx.lengthPc,
+        normalizationLengthPc: lengthPc(),
+        fovDegrees: ctx.fovDegrees,
+      },
+    );
+    lastRenderCost = performance.now() - renderStarted;
+    frames.publish({
+      camera: observationCamera,
+      context: ctx,
+      points,
+      projection: rasterProjection,
+      solarScene: observationSolarScene,
+      revision: observationRevision,
+    });
+    renderFPS.tick(performance.now());
+    setContextSpeed(
+      solar.active ? "system" : lightStats.sources.length ? "stars" : "galaxy",
+    );
+    $("continuous").setAttribute(
+      "data-neighbor-star-count",
+      String(
+        solar.active
+          ? lightStats.sources.filter((p) => p.stellarNeighbor).length
+          : 0,
+      ),
+    );
+    $("continuous").setAttribute(
+      "data-render-exposure",
+      String($("exposure").value),
+    );
+    $("continuous").setAttribute(
+      "data-reflected-count",
+      String(lightStats.reflectedCount || 0),
+    );
+    $("continuous").setAttribute(
+      "data-disc-count",
+      String(lightStats.discCount || 0),
+    );
+    $("continuous").setAttribute(
+      "data-diffuse-fraction",
+      String(lightStats.residual),
+    );
+    $("continuous").setAttribute(
+      "data-diffuse-coverage",
+      String(lightStats.diffuseCoverage),
+    );
+    $("continuous").setAttribute(
+      "data-estimated-population",
+      String(lightStats.estimatedPopulation),
+    );
+    $("continuous").setAttribute("data-camera-x", String(camera.x));
+    $("continuous").setAttribute("data-camera-y", String(camera.y));
+    $("continuous").setAttribute("data-tracked-id", trackedId || "");
+    $("continuous").setAttribute("data-source-retention", retentionMode);
+    $("continuous").setAttribute(
+      "data-retained-source-count",
+      String(retainedCount),
+    );
+    if (retentionMode !== "steady") {
+      $("continuous").setAttribute("data-last-zoom-direction", retentionMode);
+      $("continuous").setAttribute(
+        "data-last-zoom-retained-count",
+        String(retainedCount),
+      );
+    }
+    $("continuous").setAttribute(
+      "data-inferred-source-count",
+      String(points.length),
+    );
+    $("continuous").setAttribute(
+      "data-source-budget",
+      String(effectiveLightBudget),
+    );
+    $("continuous").setAttribute(
+      "data-adaptive-sources",
+      String($("adaptiveSources").checked),
+    );
+    $("continuous").setAttribute(
+      "data-density-ratio",
+      String(adaptiveDensityRatio),
+    );
+    $("continuous").setAttribute(
+      "data-source-onset",
+      String(lightCalibration.onset),
+    );
+    $("continuous").setAttribute(
+      "data-render-backend",
+      gpuLightRenderer ? "GPU" : "CPU",
+    );
+    $("continuous").setAttribute("data-stellar-detail", String(detailWeight));
+    $("continuous").setAttribute(
+      "data-observation-zoom",
+      String(projection.zoom),
+    );
+    $("continuous").setAttribute(
+      "data-sampling-truncated",
+      String(!!sampleInfo?.truncated),
+    );
+    // The display loop presents the committed image and its overlays together.
+  }
+  // Presentation can run while an async observation prepares a different frame.
+  function viewFrame(image = null, ctx = null) {
+    ctx ??= image
+      ? {
+          worldSpan: image.width,
+          worldShortSpan: image.cameraWidth ?? image.width,
+        }
+      : viewContext();
+    const local = !!solar.active,
+      hostId = local ? solar.active.system.starId : trackedId || selected,
+      host = hostId ? resolveMatter(hostId) : null,
+      originX = host?.x || 0,
+      originY = host?.y || 0,
+      unitPc = local ? PlanetarySystems.AU_PC : lengthPc(),
+      id = local ? solarTracked : trackedId;
+    const anchor = id
+      ? local
+        ? solar.resolve(id, solarOffsetYear())
+        : resolveMatter(id)
+      : null;
+    return {
+      space: local ? "system" : "galaxy",
+      referenceId: local ? hostId : null,
+      originX,
+      originY,
+      modelLengthPc: lengthPc(),
+      unitPc,
+      x:
+        (image?.centerX ?? (local ? solarCamera.x : camera.x)) -
+        (local ? 0 : originX),
+      y:
+        (image?.centerY ?? (local ? solarCamera.y : camera.y)) -
+        (local ? 0 : originY),
+      width: image?.width ?? ctx.worldSpan,
+      cameraWidth: image?.cameraWidth ?? ctx.worldShortSpan,
+      zoom: image?.zoom ?? camera.zoom,
+      fovDegrees: image?.fovDegrees ?? camera.fovDegrees,
+      follow: anchor
+        ? {
+            id,
+            x: anchor.x - (local ? 0 : originX),
+            y: anchor.y - (local ? 0 : originY),
+          }
+        : null,
+    };
+  }
+  function present(shape = screenShape()) {
+    if (!grid || !frames.current?.camera || !frames.current?.context) return;
+    syncReference();
+    const output = $("continuous"),
+      size = frames.current?.context.pixelSpan,
+      requested = committedCameraView(
+        frames.current?.camera,
+        viewFrame(null, viewContext(camera, !!solar.active, shape)),
+        solar.active ? solarTrackingPan : trackingPan,
+      ),
+      choice = coveredCameraView(
+        frames.current?.camera,
+        requested,
+        frames.current?.context,
+        shape,
+      ),
+      view = choice.view,
+      ctx = renderContext(shape, {
+        worldShortSpan: view.cameraWidth,
+        worldSpan: view.width,
+        fovDegrees: view.fovDegrees ?? camera.fovDegrees,
+        sigmaCss: stellarOptics.sigma,
+        units: view.space === "system" ? "AU" : "model",
+        lengthPc: view.unitPc,
+      });
+    presentedView = view;
+    presentedContext = ctx;
+    const transform = cameraPresentation(
+        frames.current?.camera,
+        view,
+        shape.size,
+      ),
+      ratio = (transform.scale * shape.size) / size,
+      dx = transform.x,
+      dy = transform.y,
+      width = (2 * grid.extent) / camera.zoom;
+    updateSolarOverlay(view, ctx);
+    if (gpuLightRenderer)
+      gpuLightRenderer.present(output, {
+        scale: ratio,
+        x: dx,
+        y: dy,
+        guides: solarGPUguides,
+        width: shape.pixelWidth,
+        height: shape.pixelHeight,
+        context: ctx,
+      });
+    else {
+      if (
+        output.width !== shape.pixelWidth ||
+        output.height !== shape.pixelHeight
+      ) {
+        output.width = shape.pixelWidth;
+        output.height = shape.pixelHeight;
+      }
+      const c = output.getContext("2d");
+      c.fillStyle = "#000";
+      c.fillRect(0, 0, shape.pixelWidth, shape.pixelHeight);
+      c.drawImage(
+        sceneCanvas,
+        shape.pixelWidth / 2 + dx - (sceneCanvas.width * ratio) / 2,
+        shape.pixelHeight / 2 + dy - (sceneCanvas.height * ratio) / 2,
+        sceneCanvas.width * ratio,
+        sceneCanvas.height * ratio,
+      );
+    }
+    $("viewHud").textContent = solar.active
+      ? "Système · champ " +
+        number(ctx.worldWidth) +
+        " × " +
+        number(ctx.worldHeight) +
+        " UA · " +
+        (lightStats?.discCount || 0) +
+        " surfaces · " +
+        (lightStats?.sources.filter((p) => p.stellarNeighbor).length || 0) +
+        " étoiles voisines · " +
+        solar.active.states.length +
+        " corps FMM GPU"
+      : "×" +
+        number(view.zoom) +
+        " · " +
+        (lightStats?.drawn.length || 0) +
+        " sources résolues" +
+        (calibration
+          ? " · champ " +
+            number(ctx.worldWidth * lengthPc()) +
+            " × " +
+            number(ctx.worldHeight * lengthPc()) +
+            " pc"
+          : "");
+    output.setAttribute(
+      "data-hdr-width",
+      String(gpuLightRenderer?.width || sceneCanvas.width),
+    );
+    output.setAttribute(
+      "data-hdr-height",
+      String(gpuLightRenderer?.height || sceneCanvas.height),
+    );
+    output.setAttribute("data-pixel-ratio", String(shape.pixelRatio));
+    output.setAttribute("data-navigation-pending", String(choice.pending));
+    output.setAttribute("data-presented-zoom", String(view.zoom));
+    output.setAttribute("data-presented-x", String(view.x));
+    output.setAttribute("data-presented-y", String(view.y));
+    output.setAttribute("data-world-width", String(ctx.worldWidth));
+    output.setAttribute("data-world-height", String(ctx.worldHeight));
+    output.setAttribute("data-sigma-css", String(ctx.sigmaCss));
+    output.setAttribute(
+      "data-viewport-aspect",
+      String(shape.aspectX / shape.aspectY),
+    );
+    output.setAttribute(
+      "data-presentation-backend",
+      gpuLightRenderer ? "GPU" : "CPU",
+    );
+    output.setAttribute("data-optical-zoom", String(view.zoom));
+    output.setAttribute("data-zoom-target", String(zoomMotion.target));
+    output.setAttribute("data-zoom-animating", String(zoomMotion.active));
+    output.setAttribute("data-camera-x", String(camera.x));
+    output.setAttribute("data-camera-y", String(camera.y));
+    output.setAttribute("data-tracked-id", trackedId || "");
+    output.setAttribute("data-system-host", solar.active?.system.starId || "");
+    output.setAttribute("data-system-tracked", solarTracked || "");
+    output.setAttribute("data-system-x", String(solarCamera.x));
+    output.setAttribute("data-system-y", String(solarCamera.y));
+    output.setAttribute(
+      "data-tracking-offset-x",
+      String(solar.active ? solarTrackingPan.x : trackingPan.x),
+    );
+    output.setAttribute(
+      "data-tracking-offset-y",
+      String(solar.active ? solarTrackingPan.y : trackingPan.y),
+    );
+  }
+  function renewDisplayCanvas(gpu) {
+    const mode = gpu ? "webgpu" : "2d";
+    if (
+      canvas.getAttribute?.("data-context-mode") !== mode &&
+      canvas.cloneNode
+    ) {
+      const next = canvas.cloneNode(false);
+      canvas.replaceWith(next);
+      canvas = next;
+      bindCameraCanvas(canvas);
+    }
+    canvas.setAttribute("data-context-mode", mode);
+  }
 
- requestAnimationFrame(animate);applyStellarOptics();updateAdaptiveControls();speedChanged();cameraControls();reset().then(async()=>{
-  const previewTime=Math.min(.5,Math.max(0,Number(new URLSearchParams(location.search).get('time'))||0));
-  for(let i=0;i<Math.round(previewTime/.01);i++){const progress=await grid.advance(.01,parameters());clock.consume(progress.advanced);revision++;}
-  if(previewTime){refresh();await observe(true);draw();}lastWall=performance.now();requestAnimationFrame(frame);
- });
+  function animate(now) {
+    if (!document.hidden) {
+      if (!loading && grid) {
+        updateTracking();
+        const native = screenShape();
+        if (
+          (renderSizeDirty ||
+            (gpuLightRenderer?.width || sceneCanvas.width) !==
+              native.pixelWidth ||
+            (gpuLightRenderer?.height || sceneCanvas.height) !==
+              native.pixelHeight) &&
+          projection &&
+          observationCamera
+        ) {
+          paint(true);
+          renderSizeDirty = false;
+        }
+        if (zoomMotion.active) {
+          const anchor = zoomMotion.anchor,
+            z = zoomMotion.at(now);
+          applyZoom(z, anchor);
+        }
+        present(native);
+        displayFPS.tick(now);
+      }
+      if (now - lastHud >= 250) {
+        lastHud = now;
+        const fps = displayFPS.rate(now),
+          render = renderFPS.rate(now);
+        $("fps").textContent = fps ? fps.toFixed(0) + " FPS" : "— FPS";
+        $("renderRate").textContent =
+          (gpuLightRenderer ? "GPU · " : "CPU · ") +
+          render.toFixed(0) +
+          " images calculées/s";
+        $("continuous").setAttribute("data-fps", String(fps));
+      }
+    }
+    requestAnimationFrame(animate);
+  }
+  function draw() {
+    if (!grid || !diagnostics) return;
+    paint();
+    $("simulationState").textContent = running
+      ? "EN MARCHE"
+      : manual
+        ? "AVANCE MANUELLE"
+        : "EN PAUSE";
+    $("time").value = (Number(clock.integrated) / Number(MODEL_NS)).toFixed(3);
+    $("physicalTime").textContent = clock.format($("timeUnit").value);
+    $("fineTime").textContent = clock.format("s");
+    $("gridMass").value = (diagnostics.mass * 100).toFixed(2) + " %";
+    $("gridAngular").value = (
+      diagnostics.angularMomentum - initialL
+    ).toExponential(1);
+    const displayUnit = rateUnit(),
+      now = performance.now();
+    if (now - rateStamp >= 500) {
+      actualRate =
+        ((Number(clock.visible() - rateAnchor) / Number(unitNs(displayUnit))) *
+          1000) /
+        (now - rateStamp);
+      rateStamp = now;
+      rateAnchor = clock.visible();
+    }
+    const desired = clock.rateNumber() / Number(unitNs(displayUnit)),
+      limited =
+        running &&
+        (clock.limited ||
+          (actualRate < desired * 0.85 && (grid.time > 0 || solar.active)));
+    $("rateStatus").textContent =
+      rateError ||
+      `Demandé : ${number(desired)} ${displayUnit}/s · obtenu : ${number(Math.max(0, actualRate))} ${displayUnit}/s` +
+        (limited ? " · limité par le calcul." : "") +
+        (limited && localDynamics?.patch
+          ? " Pas local ≤ " + number(localDynamics.stepLimit * 1e6) + " y."
+          : "");
+    $("factorStatus").textContent =
+      "Facteur exact × " + clock.factorRatio() + " par rapport à 1 My/s.";
+    const meanNumber = lightStats?.estimatedPopulation || 0,
+      estimated = BigInt(Math.max(0, Math.round(meanNumber))),
+      text = estimated.toString(),
+      estimateText =
+        meanNumber > 0 && meanNumber < 1
+          ? "moins de 1 (moyenne du champ)"
+          : text.length > 8
+            ? text[0] + "." + text.slice(1, 4) + "e" + (text.length - 1)
+            : text;
+    $("observationStatus").textContent =
+      `${lightStats?.drawn.length || 0} sources résolues (plafond ${effectiveLightBudget}) · population locale estimée : ${estimateText}. ` +
+      (lightStats?.complete && detailWeight === 1
+        ? "Toute la lumière locale est portée par les étoiles. "
+        : `Fond statistique : ${(100 * (lightStats?.diffuseCoverage || 0)).toFixed(2)} % selon la densité estimée et la résolution optique. `) +
+      (detailWeight === 0
+        ? "Vue diffuse : rapprocher la caméra pour distinguer les étoiles. "
+        : "") +
+      `Identités persistantes · ${materials.groups.length.toLocaleString("fr-FR")} groupes transportés · états individuels limités au voisinage FMM.` +
+      (sampleInfo?.truncated
+        ? " Budget de recherche atteint : échantillon incomplet."
+        : "") +
+      (materials.refinementLimited
+        ? " Limite de raffinement des trajectoires atteinte."
+        : "");
+    if (solar.active)
+      $("observationStatus").textContent =
+        solar.active.states.length.toLocaleString("fr-FR") +
+        " corps physiques · disques réfléchissant la lumière de l’étoile hôte · étoile sans aigrettes. " +
+        "Rayons physiques ; contours pointillés pour les objets non résolus.";
+    $("lightCalibrationCount").textContent = solar.active
+      ? "Disques du système : " +
+        (lightStats?.drawn.length || 0).toLocaleString("fr-FR")
+      : "Sources visibles : " +
+        (lightStats?.drawn.length || 0).toLocaleString("fr-FR") +
+        " / " +
+        effectiveLightBudget.toLocaleString("fr-FR");
+    updateStarCard();
+    $("trackingStatus").textContent = trackedId
+      ? "Référentiel de " +
+        stellarName(trackedId) +
+        " · caméra attachée à cette identité."
+      : "Caméra libre · vue perspective au-dessus du plan stellaire.";
+    $("stopTracking").hidden = !trackedId;
+    $("exposureValue").textContent =
+      Number($("exposure").value).toFixed(2) + " EV";
+    const local = localDynamics.status();
+    $("localStatus").textContent =
+      local.reason +
+      (local.active
+        ? " · " +
+          local.count +
+          " étoiles, garde " +
+          number(local.widthPc) +
+          " pc · " +
+          local.ms.toFixed(1) +
+          " ms"
+        : "") +
+      " · " +
+      local.backend +
+      " · " +
+      local.records +
+      " trajectoires matérialisées.";
+    $("localCount").textContent =
+      local.count.toLocaleString("fr-FR") +
+      " étoiles locales · " +
+      local.backend;
+    $("localCount").setAttribute("data-count", String(local.count));
+    $("localCount").setAttribute("data-backend", local.backend);
+    updateSolarCard();
+    updateSolarStatus();
+    $("status").textContent =
+      "Physique " +
+      lastCost.toFixed(0) +
+      " ms (" +
+      lastSteps +
+      " pas, " +
+      number(lastAdvanced) +
+      " My) · recherche " +
+      lastObserveCost.toFixed(0) +
+      " ms · lumière " +
+      (gpuLightRenderer ? "GPU, " : "CPU, ") +
+      lastRenderCost.toFixed(0) +
+      " ms CPU · masse restante " +
+      (diagnostics.mass * 100).toFixed(3) +
+      " % · sorties espace " +
+      (diagnostics.spatialLoss * 100).toFixed(3) +
+      " %. Le champ collectif continue au-delà de la zone locale.";
+    dirty = false;
+  }
+  function updateStarCard() {
+    $("starCard").hidden = !selected || !!solarSelected;
+    $("starHint").hidden = !!selected;
+    if (!selected || solarSelected) return;
+    const p = resolveMatter(selected, galacticOffset()),
+      length = calibration ? 10000 : 1,
+      velocity = calibration ? calibration.velocityKmS : 1,
+      properties = stellarProperties(selected),
+      anchor = trackedId ? resolveMatter(trackedId, galacticOffset()) : null;
+    if (!solarSelected && document.activeElement !== $("materialId"))
+      $("materialId").value = p.id;
+    $("starName").textContent = stellarName(p.id);
+    $("selectedStar").textContent = "ID · " + p.id;
+    $("starSpeed").textContent =
+      (Math.hypot(p.vx, p.vy) * velocity).toPrecision(7) +
+      (calibration ? " km/s" : " unités / My");
+    $("starVelocity").textContent =
+      `vx=${(p.vx * velocity).toPrecision(7)}, vy=${(p.vy * velocity).toPrecision(7)}` +
+      (calibration ? " km/s" : " unités / My");
+    $("starPositionLabel").textContent = calibration
+      ? "Coordonnées galactiques (pc)"
+      : "Coordonnées du modèle";
+    $("starPosition").textContent =
+      `x=${(p.x * length).toPrecision(17)}, y=${(p.y * length).toPrecision(17)}`;
+    for (const [key, value] of Object.entries({
+      x: p.x,
+      y: p.y,
+      vx: p.vx,
+      vy: p.vy,
+    }))
+      $("starPosition").setAttribute("data-" + key, String(value));
+    $("trackStar").textContent = (
+      solar.active ? solarTracked === selected : trackedId === selected
+    )
+      ? "Arrêter le suivi"
+      : "Suivre · référentiel de cette étoile";
+    $("trackStar").setAttribute(
+      "aria-pressed",
+      String(solar.active ? solarTracked === selected : trackedId === selected),
+    );
+    $("starRelative").textContent = anchor
+      ? `Δx=${number((p.x - anchor.x) * length)}, Δy=${number((p.y - anchor.y) * length)}${calibration ? " pc" : ""} · |Δv|=${number(Math.hypot(p.vx - anchor.vx, p.vy - anchor.vy) * velocity)}${calibration ? " km/s" : ""}`
+      : "Référentiel galactique";
+    $("starMass").textContent = number(properties.mass) + " M☉";
+    $("starLuminosity").textContent = number(properties.luminosity) + " L☉";
+    $("starRadius").textContent =
+      number(properties.radius) +
+      " R☉ · " +
+      number((properties.radius * StellarPopulation.solarRadiusM) / 1000) +
+      " km";
+    $("starTemperature").textContent =
+      Math.round(properties.temperature).toLocaleString("fr-FR") +
+      " K · " +
+      properties.type;
+    if (frames.current?.projection && frames.current?.context) {
+      const ctx = frames.current?.context,
+        framePoint =
+          frames.current?.camera.space === "system"
+            ? {
+                ...p,
+                x:
+                  ((p.x - frames.current?.camera.originX) * lengthPc()) /
+                  PlanetarySystems.AU_PC,
+                y:
+                  ((p.y - frames.current?.camera.originY) * lengthPc()) /
+                  PlanetarySystems.AU_PC,
+              }
+            : p,
+        optics = sourceOptics(
+          framePoint,
+          cameraGeometry(frames.current?.projection, {
+            lengthPc: ctx.lengthPc,
+            fovDegrees: ctx.fovDegrees,
+            context: ctx,
+          }),
+        );
+      $("starDistance").textContent = number(optics.distancePc) + " pc";
+      $("starFlux").textContent =
+        number(optics.fluxWm2) + " W/m² (bolométrique)";
+      $("starAppearance").textContent = photosphereResolution(
+        optics.radiusPixels,
+        ctx.sigmaPixels,
+      ).resolved
+        ? "Photosphère résolue"
+        : "Disque non résolu · éclat optique";
+    }
+  }
+  function syncReference(force = false) {
+    const id = solar.active ? solarTracked || "" : trackedId || "",
+      input = $("referenceId"),
+      focused = document.activeElement === input;
+    if (
+      id !== referenceLastId &&
+      !focused &&
+      !referenceBusy &&
+      !pendingReference
+    ) {
+      referenceDraft = false;
+      referenceError = "";
+    }
+    referenceLastId = id;
+    if (force || !referenceDraft) {
+      if (input.value !== id) input.value = id;
+    }
+    let name = "Caméra libre";
+    if (id)
+      name = solar.active
+        ? solar.resolve(id, solarOffsetYear()).name
+        : stellarName(id);
+    const status =
+      referenceError ||
+      (referenceBusy || pendingReference
+        ? "Changement de référentiel…"
+        : referenceDraft
+          ? "Entrée pour valider · " + name
+          : name);
+    if ($("referenceStatus").textContent !== status)
+      $("referenceStatus").textContent = status;
+    input.title = id;
+    input.setAttribute("aria-invalid", String(!!referenceError));
+    $("referenceControl").setAttribute("data-reference-id", id);
+    $("releaseReference").disabled = !id && !pendingReference && !referenceBusy;
+  }
+  function requestReference() {
+    referenceDraft = true;
+    referenceError = "";
+    try {
+      if (!grid || !materials || loading)
+        throw Error("Attendre la préparation de la simulation.");
+      let id = $("referenceId").value.trim();
+      if (!id) {
+        pendingReference = {
+          kind: "free",
+          sequence: ++referenceSequence,
+          draftVersion: referenceDraftVersion,
+        };
+        return;
+      }
+      if (/^\d+$/.test(id)) {
+        if (!solar.active)
+          throw Error("Un rang seul demande un système ouvert.");
+        id = solar.active.system.prefix + "/body/" + BigInt(id);
+      }
+      const body = id.match(/^(.+)\/system\/v2\/body\/(0|[1-9]\d*)$/);
+      if (body) {
+        if (!grid.isGPU || !gpuLightRenderer)
+          throw Error("Ce référentiel demande WebGPU.");
+        resolveMatter(body[1]);
+        const system =
+          solar.active?.system.starId === body[1]
+            ? solar.active.system
+            : PlanetarySystems.describe(body[1]);
+        PlanetarySystems.body(system, id);
+        if (
+          !solar.histories.has(body[1]) &&
+          solar.histories.size >= solar.maxSystems
+        )
+          throw Error("Budget des systèmes visités atteint.");
+        pendingReference = {
+          kind: "body",
+          id,
+          starId: body[1],
+          sequence: ++referenceSequence,
+          draftVersion: referenceDraftVersion,
+        };
+      } else {
+        resolveMatter(id);
+        pendingReference = {
+          kind: "star",
+          id,
+          sequence: ++referenceSequence,
+          draftVersion: referenceDraftVersion,
+        };
+      }
+    } catch (error) {
+      referenceError = error.message;
+    }
+    syncReference();
+  }
+  async function processReference() {
+    const request = pendingReference;
+    if (!request) return;
+    pendingReference = null;
+    referenceBusy = physicsBusy = true;
+    try {
+      if (request.kind === "free") {
+        stopTracking();
+      } else if (request.kind === "star") {
+        leaveSolar();
+        stopTracking();
+        const p = resolveMatter(request.id);
+        selected = trackedId = request.id;
+        camera.x = p.x;
+        camera.y = p.y;
+        changeZoom(camera.zoom);
+        showTab("object");
+      } else {
+        const same = solar.active?.system.starId === request.starId;
+        if (!same) {
+          leaveSolar();
+          stopTracking();
+          const p = resolveMatter(request.starId);
+          selected = trackedId = request.starId;
+          camera.x = p.x;
+          camera.y = p.y;
+          $("planetaryEnabled").checked = true;
+          const description = PlanetarySystems.describe(request.starId);
+          changeZoom(solarFullWidthAU() / (2.8 * description.extent));
+          if (!(await prepareSolar()))
+            throw Error("Impossible d’ouvrir ce système.");
+        }
+        await solar.activate(
+          request.starId,
+          clock.integrated,
+          $("systemAsteroids").value === "auto"
+            ? null
+            : Number($("systemAsteroids").value),
+          request.id,
+        );
+        if (request.sequence !== referenceSequence) return;
+        selected = trackedId = request.starId;
+        solarSelected = solarTracked = request.id;
+        Object.assign(solarTrackingPan, { x: 0, y: 0 });
+        const p = solar.resolve(request.id, solarOffsetYear());
+        solarCamera.x = p.x;
+        solarCamera.y = p.y;
+        changeZoom(camera.zoom);
+        showTab("object");
+      }
+      if (request.sequence === referenceSequence) {
+        referenceError = "";
+        if (referenceDraftVersion === request.draftVersion)
+          referenceDraft = false;
+      }
+      observationKey = "";
+      dirty = true;
+    } catch (error) {
+      if (request.sequence === referenceSequence)
+        referenceError = error.message;
+    } finally {
+      physicsBusy = referenceBusy = false;
+      referenceLastId = solar.active ? solarTracked || "" : trackedId || "";
+      syncReference(
+        !referenceDraft &&
+          !pendingReference &&
+          request.sequence === referenceSequence,
+      );
+    }
+  }
+  function displayRatio(value) {
+    if (!value.includes("/")) return value;
+    const [a, b] = value.split("/").map(BigInt);
+    let scale = 1n;
+    for (let digits = 0; digits <= 18; digits++, scale *= 10n) {
+      if (scale % b === 0n) {
+        const v = (a * scale) / b,
+          whole = v / scale,
+          tail = digits
+            ? (v % scale).toString().padStart(digits, "0").replace(/0+$/, "")
+            : "";
+        return whole + (tail ? "." + tail : "");
+      }
+    }
+    return value;
+  }
+  function boundSpeed(automatic = false) {
+    let clamped = false;
+    if (clock.rateNumerator < clock.rateDenominator) {
+      clock.configureRate(1n, 1n);
+      clamped = true;
+    }
+    if (clock.rateNumerator > rateCeiling * clock.rateDenominator) {
+      clock.configureRate(rateCeiling, 1n);
+      clamped = true;
+    }
+    if (clamped) {
+      if (automatic && speedMode === "rate")
+        $("speedUnit").value = rateContext === "galaxy" ? "Gy" : "y";
+      $("speedValue").value = displayRatio(
+        clock.quantity($("speedUnit").value),
+      );
+      $("factorValue").value = clock.factorRatio();
+    }
+    const slider = $("rateSlider");
+    slider.min = "0";
+    slider.max = "1000";
+    slider.step = "1";
+    slider.value = String(
+      ((Math.log10(clock.rateNumber() / 1e9) + 9) /
+        (Math.log10(Number(rateCeiling) / 1e9) + 9)) *
+        1000,
+    );
+    $("faster").disabled =
+      clock.rateNumerator >= rateCeiling * clock.rateDenominator;
+    $("slower").disabled = clock.rateNumerator <= clock.rateDenominator;
+    if (clamped) $("pacePreset").value = "custom";
+    $("simulationBar").setAttribute("data-max-rate-ns", String(rateCeiling));
+    $("simulationBar").setAttribute("data-rate-ns", String(clock.rateNumber()));
+    $("simulationBar").setAttribute("data-rate-context", rateContext);
+    return clamped;
+  }
+  function setContextSpeed(context) {
+    const changed = rateContext !== context;
+    rateContext = context;
+    rateCeiling =
+      context === "system"
+        ? unitNs("y") / 10n
+        : context === "stars"
+          ? 100n * unitNs("y")
+          : unitNs("Gy");
+    $("rateLimitLabel").textContent =
+      context === "system"
+        ? "Système · plafond 0,1 an/s"
+        : context === "stars"
+          ? "Étoiles · plafond 100 ans/s"
+          : "Galaxie · plafond 1 Gy/s";
+    if (boundSpeed(changed)) {
+      rateStamp = lastWall = performance.now();
+      rateAnchor = clock.visible();
+      actualRate = 0;
+      dirty = true;
+    }
+  }
+  function speedChanged() {
+    try {
+      if (speedMode === "factor") clock.setFactor($("factorValue").value);
+      else clock.setRate($("speedValue").value, $("speedUnit").value);
+      boundSpeed();
+      rateError = "";
+      const key = $("speedValue").value + ":" + $("speedUnit").value;
+      $("pacePreset").value =
+        speedMode === "rate" && ["1:My", "1:y", "1:s", "1:Gy"].includes(key)
+          ? key
+          : "custom";
+      rateStamp = lastWall = performance.now();
+      rateAnchor = clock.visible();
+      actualRate = 0;
+      dirty = true;
+    } catch (e) {
+      rateError = e.message;
+      $("rateStatus").textContent = e.message;
+      dirty = true;
+    }
+  }
+  function mode(next) {
+    speedMode = next;
+    $("rateGroup").hidden = next !== "rate";
+    $("factorGroup").hidden = next !== "factor";
+    $("modeRate").setAttribute("aria-pressed", String(next === "rate"));
+    $("modeFactor").setAttribute("aria-pressed", String(next === "factor"));
+    if (next === "factor") $("factorValue").value = clock.factorRatio();
+    else $("speedValue").value = clock.quantity($("speedUnit").value);
+    dirty = true;
+  }
+  $("referenceId").addEventListener("input", () => {
+    referenceDraft = true;
+    referenceError = "";
+    referenceDraftVersion++;
+    syncReference();
+  });
+  $("referenceId").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      requestReference();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      referenceDraft = false;
+      referenceError = "";
+      syncReference(true);
+    }
+  });
+  $("applyReference").addEventListener("click", requestReference);
+  $("releaseReference").addEventListener("click", () => {
+    referenceDraft = false;
+    referenceError = "";
+    pendingReference = {
+      kind: "free",
+      sequence: ++referenceSequence,
+      draftVersion: referenceDraftVersion,
+    };
+  });
+  $("modeRate").addEventListener("click", () => mode("rate"));
+  $("modeFactor").addEventListener("click", () => mode("factor"));
+  $("applySpeed").addEventListener("click", speedChanged);
+  $("factorValue").addEventListener("change", speedChanged);
+  for (const id of ["speedValue", "factorValue"])
+    $(id).addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        speedChanged();
+      }
+    });
+  for (const [id, mult, div] of [
+    ["slower", 1n, 10n],
+    ["faster", 10n, 1n],
+  ])
+    $(id).addEventListener("click", () => {
+      clock.configureRate(
+        clock.rateNumerator * mult,
+        clock.rateDenominator * div,
+      );
+      if (speedMode === "factor") $("factorValue").value = clock.factorRatio();
+      else $("speedValue").value = clock.quantity($("speedUnit").value);
+      speedChanged();
+    });
+  $("pacePreset").addEventListener("change", () => {
+    if ($("pacePreset").value === "custom") return;
+    const [value, unit] = $("pacePreset").value.split(":");
+    mode("rate");
+    $("speedValue").value = value;
+    $("speedUnit").value = unit;
+    speedChanged();
+  });
+  for (const id of ["speedValue", "speedUnit"])
+    $(id).addEventListener("change", speedChanged);
+  $("timeUnit").addEventListener("change", () => {
+    dirty = true;
+  });
+  $("scenario").addEventListener("change", () => {
+    if ($("scenario").value === "milkyway") {
+      $("population").value = "11";
+      $("softening").value = ".015";
+    }
+    reset();
+  });
+  for (const id of ["count", "softening"])
+    $(id).addEventListener("change", reset);
+  $("structure").addEventListener("input", () => {
+    $("structureValue").textContent =
+      Math.round(Number($("structure").value) * 100) + " %";
+  });
+  $("structure").addEventListener("change", reset);
+  $("engine").addEventListener("change", () => {
+    $("resolution").value = $("engine").value === "gpu" ? "64,33" : "28,25";
+    reset();
+  });
+  $("resolution").addEventListener("change", () => {
+    const n = Number($("resolution").value.split(",")[0]);
+    $("engine").value = (n & (n - 1)) === 0 ? "gpu" : "cpu";
+    reset();
+  });
+  $("reset").addEventListener("click", reset);
+  $("pause").addEventListener("click", () => {
+    if (manual) {
+      manual = false;
+      running = false;
+    } else running = !running;
+    if (!running && clock.debt >= clock.quantum()) clock.debt = 0n;
+    updateTracking();
+    present();
+    lastWall = performance.now();
+    $("pause").textContent = running ? "Pause" : "Reprendre";
+    dirty = true;
+  });
+  $("step").addEventListener("click", () => {
+    try {
+      const amount = physicalNs($("stepValue").value, $("stepUnit").value);
+      if (amount <= 0n) throw Error("Durée strictement positive attendue.");
+      running = false;
+      clock.debt += amount;
+      manual = true;
+      $("pause").textContent = "Arrêter l’avance";
+      dirty = true;
+    } catch (e) {
+      $("rateStatus").textContent = e.message;
+    }
+  });
+  $("zoomSlider").addEventListener("input", () =>
+    requestZoom(2 ** Number($("zoomSlider").value)),
+  );
+  $("zoomValue").addEventListener("change", () =>
+    requestZoom(Number($("zoomValue").value)),
+  );
+  $("zoomIn").addEventListener("click", () =>
+    requestZoom((zoomMotion.active ? zoomMotion.target : camera.zoom) * 2),
+  );
+  $("zoomOut").addEventListener("click", () => requestZoom(camera.zoom / 2));
+  $("home").addEventListener("click", () => {
+    leaveSolar();
+    stopTracking();
+    if (objectExposure) {
+      $("exposure").value = "0";
+      objectExposure = false;
+    }
+    Object.assign(camera, { x: 0, y: 0, zoom: 1 });
+    zoomMotion.cancel(1);
+    cameraControls();
+  });
+  for (const id of ["centerX", "centerY"])
+    $(id).addEventListener("change", () => {
+      if (solar.active) leaveSolar();
+      const x = Number($("centerX").value),
+        y = Number($("centerY").value);
+      if (grid && Number.isFinite(x) && Number.isFinite(y)) {
+        stopTracking();
+        camera.x = Math.max(-grid.extent, Math.min(grid.extent, x));
+        camera.y = Math.max(-grid.extent, Math.min(grid.extent, y));
+        cameraControls();
+      }
+    });
+  $("cameraHeight").addEventListener("change", () => {
+    const h = Number($("cameraHeight").value);
+    if (grid && Number.isFinite(h) && h > 0)
+      changeZoom(
+        (solar.active ? solarFullWidthAU() : 2 * grid.extent * lengthPc()) /
+          (2 * Math.tan((camera.fovDegrees * Math.PI) / 360) * h),
+      );
+    else cameraControls();
+  });
+  $("cameraFov").addEventListener("change", () => {
+    const h = cameraHeight(),
+      fov = Number($("cameraFov").value);
+    if (grid && Number.isFinite(fov)) {
+      camera.fovDegrees = Math.max(10, Math.min(100, fov));
+      $("cameraFov").value = camera.fovDegrees;
+      changeZoom(
+        (solar.active ? solarFullWidthAU() : 2 * grid.extent * lengthPc()) /
+          (2 * Math.tan((camera.fovDegrees * Math.PI) / 360) * h),
+      );
+      observationKey = "";
+    }
+  });
+  $("localStars").addEventListener("change", () => {
+    observationKey = "";
+    dirty = true;
+  });
+  for (const id of ["starBudget", "starOnset"]) {
+    $(id).addEventListener("change", applyLightCalibration);
+    $(id).addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        applyLightCalibration();
+      }
+    });
+    $(id).addEventListener("input", () => {
+      $("lightCalibrationStatus").textContent =
+        "Saisie en cours · réglage actif : " + lightCalibrationLabel();
+    });
+  }
+  $("applyLightCalibration").addEventListener("click", applyLightCalibration);
+  $("resetLightCalibration").addEventListener("click", () => {
+    $("adaptiveSources").checked = false;
+    $("starBudget").value = String(defaultLightCalibration.budget);
+    $("starOnset").value = String(defaultLightCalibration.onset);
+    applyLightCalibration();
+  });
+  for (const [id, key, multiplier] of [
+    ["budgetHalve", "budget", 0.5],
+    ["budgetDouble", "budget", 2],
+    ["onsetHalve", "onset", 0.5],
+    ["onsetDouble", "onset", 2],
+  ])
+    $(id).addEventListener("click", () => {
+      try {
+        const next = readLightCalibration(
+          $("starBudget").value,
+          $("starOnset").value,
+        );
+        next[key] =
+          key === "budget"
+            ? Math.floor(next[key] * multiplier)
+            : next[key] * multiplier;
+        $("starBudget").value = String(next.budget);
+        $("starOnset").value = String(next.onset);
+        applyLightCalibration();
+      } catch (error) {
+        showLightCalibration(error);
+      }
+    });
+  for (const id of [
+    "psfWidth",
+    "glareStrength",
+    "spikeAngle",
+    "opticalProfile",
+    ...opticalFields,
+    ...fadeFields,
+    "stellarFadeEnabled",
+  ])
+    $(id).addEventListener("input", applyStellarOptics);
+  $("resetStellarOptics").addEventListener("click", () => {
+    for (const [id, value] of Object.entries({
+      psfWidth: defaultStellarOptics.sigma,
+      glareStrength: defaultStellarOptics.glare,
+      spikeAngle: defaultStellarOptics.angle,
+      opticalProfile: defaultStellarOptics.profile,
+      ...DEFAULT_OPTICAL_SHAPE,
+      fadeStart: DEFAULT_STELLAR_FADE.start,
+      fadeEnd: DEFAULT_STELLAR_FADE.end,
+      fadeCurve: DEFAULT_STELLAR_FADE.curve,
+    }))
+      $(id).value = String(value);
+    $("stellarFadeEnabled").checked = DEFAULT_STELLAR_FADE.enabled;
+    applyStellarOptics();
+  });
+  $("adaptiveSources").addEventListener("change", () => {
+    $("starBudget").value = String(lightCalibration.budget);
+    updateAdaptiveControls();
+    if ($("lightCalibrationStatus").getAttribute("data-error") !== "true")
+      showLightCalibration();
+    observationKey = "";
+    dirty = true;
+  });
+  $("exposure").addEventListener("input", () => {
+    objectExposure = false;
+    observationKey = "";
+    dirty = true;
+  });
+  $("resetExposure").addEventListener("click", () => {
+    $("exposure").value = "0";
+    objectExposure = false;
+    observationKey = "";
+    dirty = true;
+  });
+  $("population").addEventListener("change", reset);
+  $("simulationTab").addEventListener("click", () => showTab("simulation"));
+  $("objectTab").addEventListener("click", () => showTab("object"));
+  $("advancedTab").addEventListener("click", () => showTab("advanced"));
+  $("newSimulationToggle").addEventListener("click", () =>
+    $("newSimulationDialog").showModal(),
+  );
+  for (const id of ["closeNewSimulation", "doneNewSimulation"])
+    $(id).addEventListener("click", () => $("newSimulationDialog").close());
+  $("rateSlider").addEventListener("input", () => {
+    const t = Number($("rateSlider").value) / 1000,
+      seconds = 10 ** (-9 + t * (Math.log10(Number(rateCeiling) / 1e9) + 9));
+    mode("rate");
+    if (t === 1) {
+      clock.configureRate(rateCeiling, 1n);
+      $("speedValue").value = displayRatio(
+        clock.quantity($("speedUnit").value),
+      );
+    } else if (t === 0) {
+      clock.configureRate(1n, 1n);
+      $("speedUnit").value = "ns";
+      $("speedValue").value = "1";
+    } else {
+      $("speedUnit").value = "s";
+      $("speedValue").value = seconds.toPrecision(12);
+    }
+    speedChanged();
+  });
+  for (const id of ["localDynamics", "localGuard"])
+    $(id).addEventListener("change", () => {
+      observationKey = "";
+      dirty = true;
+    });
+  $("findMaterial").addEventListener("click", () => {
+    if (
+      solar.active &&
+      (/^\d+$/.test($("materialId").value.trim()) ||
+        $("materialId").value.includes("/system/") ||
+        $("materialId").value === solar.active.system.starId)
+    ) {
+      findSolarBody();
+      return;
+    }
+    try {
+      leaveSolar();
+      const p = resolveMatter($("materialId").value, galacticOffset());
+      stopTracking();
+      selected = p.id;
+      showTab("object");
+      camera.x = p.x;
+      camera.y = p.y;
+      changeZoom(camera.zoom);
+      observationKey = "";
+      $("lookupStatus").textContent = "";
+    } catch (e) {
+      $("lookupStatus").textContent = e.message;
+    }
+  });
+  $("closeStar").addEventListener("click", () => {
+    selected = null;
+    $("starCard").hidden = true;
+    $("starHint").hidden = false;
+    showTab("simulation");
+    dirty = true;
+  });
+  $("centerStar").addEventListener("click", () => {
+    if (solar.active) {
+      solarTracked = null;
+      Object.assign(solarTrackingPan, { x: 0, y: 0 });
+      const p = selected ? solarScenePoint(selected) : { x: 0, y: 0 };
+      solarCamera.x = p.x;
+      solarCamera.y = p.y;
+      dirty = true;
+      return;
+    }
+    if (selected) {
+      stopTracking();
+      const p = resolveMatter(selected, galacticOffset());
+      camera.x = p.x;
+      camera.y = p.y;
+      changeZoom(camera.zoom);
+    }
+  });
+  $("trackStar").addEventListener("click", () => {
+    if (!selected) return;
+    if (solar.active && selected !== solar.active.system.starId) {
+      $("referenceId").value = selected;
+      requestReference();
+      return;
+    }
+    if (solar.active) {
+      Object.assign(solarTrackingPan, { x: 0, y: 0 });
+      solarTracked = solarTracked === selected ? null : selected;
+      solarSelected = null;
+      dirty = true;
+      return;
+    }
+    if (trackedId === selected) stopTracking();
+    else {
+      Object.assign(trackingPan, { x: 0, y: 0 });
+      trackedId = selected;
+      updateTracking();
+      changeZoom(camera.zoom);
+    }
+    dirty = true;
+  });
+  $("meterStar").addEventListener("click", exposeForStar);
+  $("inspectSurface").addEventListener("click", () => {
+    if (!selected || !grid) return;
+    if (solar.active && selected === solar.active.system.starId) {
+      inspectSolarBody(solar.active.system.starId);
+      return;
+    }
+    if (solar.active) leaveSolar();
+    Object.assign(trackingPan, { x: 0, y: 0 });
+    trackedId = selected;
+    updateTracking();
+    const R =
+      stellarProperties(selected).radius * StellarPopulation.solarRadiusPc;
+    changeZoom(
+      (2 * grid.extent * lengthPc()) /
+        (2 * Math.tan((camera.fovDegrees * Math.PI) / 360) * 10 * R),
+    );
+    exposeForStar();
+  });
+  $("visitSystem").addEventListener("click", visitSelectedSystem);
+  $("systemOverview").addEventListener("click", solarOverview);
+  $("leaveSystem").addEventListener("click", () => {
+    leaveSolar();
+    changeZoom(solarFullWidthAU() / 30000);
+  });
+  for (const id of [
+    "planetaryEnabled",
+    "systemAsteroids",
+    "systemMask",
+    "systemGuides",
+  ])
+    $(id).addEventListener("change", () => {
+      observationKey = "";
+      dirty = true;
+    });
+  $("trackSystemBody").addEventListener("click", () => {
+    if (solarSelected) {
+      Object.assign(solarTrackingPan, { x: 0, y: 0 });
+      solarTracked = solarTracked === solarSelected ? null : solarSelected;
+      updateSolarTracking();
+      dirty = true;
+    }
+  });
+  $("inspectSystemBody").addEventListener("click", () => {
+    if (solarSelected) inspectSolarBody(solarSelected);
+  });
+  $("systemHost").addEventListener("click", () => {
+    if (!solar.active) return;
+    Object.assign(solarTrackingPan, { x: 0, y: 0 });
+    solarSelected = null;
+    selected = solar.active.system.starId;
+    solarTracked = selected;
+    updateStarCard();
+    updateSolarCard();
+    showTab("object");
+    dirty = true;
+  });
+  function findSolarBody() {
+    try {
+      if (!solar.active) throw Error("Ouvrir d’abord le système d’une étoile.");
+      const raw = $("materialId").value.trim(),
+        id = /^\d+$/.test(raw)
+          ? solar.active.system.prefix + "/body/" + BigInt(raw)
+          : raw;
+      PlanetarySystems.body(solar.active.system, id);
+      solarSelected = id === solar.active.system.starId ? null : id;
+      solarTracked = id;
+      Object.assign(solarTrackingPan, { x: 0, y: 0 });
+      const p = solar.resolve(id, solarOffsetYear());
+      solarCamera.x = p.x;
+      solarCamera.y = p.y;
+      showTab("object");
+      $("lookupStatus").textContent = "";
+      dirty = true;
+    } catch (error) {
+      $("lookupStatus").textContent = error.message;
+    }
+  }
+  $("materialId").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      $("findMaterial").click();
+    }
+  });
+  $("stopTracking").addEventListener("click", stopTracking);
+  $("followStar").addEventListener("click", () => {
+    const p = selected
+      ? resolveMatter(selected, galacticOffset())
+      : lightStats?.drawn[0] ||
+        points[0] ||
+        materials.sample({ ...camera, budget: 1, offset: galacticOffset() })
+          .points[0];
+    if (p) {
+      stopTracking();
+      selected = p.id;
+      showTab("object");
+      $("materialId").value = p.id;
+      camera.x = p.x;
+      camera.y = p.y;
+      changeZoom(camera.zoom * 4);
+    }
+  });
+  let canvas = $("continuous");
+  function screenShape(size = null) {
+    const box = canvas.getBoundingClientRect?.() || {};
+    return viewportGeometry(box.width || 600, box.height || 600, {
+      pixelRatio: globalThis.devicePixelRatio || 1,
+      size,
+      maxDimension:
+        gpuLightRenderer?.device?.limits?.maxTextureDimension2D || 8192,
+    });
+  }
+  const world = (event) => {
+    const r = canvas.getBoundingClientRect(),
+      v = presentedView || viewFrame(),
+      ctx = presentedContext || viewContext(),
+      x = v.x + (event.clientX - r.left - r.width / 2) * ctx.worldPerCssPixel,
+      y = v.y + (r.height / 2 - event.clientY + r.top) * ctx.worldPerCssPixel;
+    if (
+      v.space === "system" &&
+      solar.active &&
+      v.referenceId === solar.active.system.starId
+    )
+      return { x, y };
+    if (v.space === "galaxy" && !solar.active)
+      return { x: v.originX + x, y: v.originY + y };
+    const px = v.originX * lengthPc() + x * v.unitPc,
+      py = v.originY * lengthPc() + y * v.unitPc;
+    if (solar.active) {
+      const host = resolveMatter(solar.active.system.starId);
+      return {
+        x: (px - host.x * lengthPc()) / PlanetarySystems.AU_PC,
+        y: (py - host.y * lengthPc()) / PlanetarySystems.AU_PC,
+      };
+    }
+    return { x: px / lengthPc(), y: py / lengthPc() };
+  };
+  function bindCameraCanvas(canvas) {
+    canvas.addEventListener(
+      "wheel",
+      (event) => {
+        event.preventDefault();
+        if (loading || !grid) return;
+        requestZoom(
+          (event.deltaY > 0
+            ? camera.zoom
+            : zoomMotion.active
+              ? zoomMotion.target
+              : camera.zoom) * Math.exp(-event.deltaY * 0.002),
+          world(event),
+        );
+      },
+      { passive: false },
+    );
+    canvas.addEventListener("mousedown", (event) => {
+      if (event.button === 1) event.preventDefault();
+    });
+    canvas.addEventListener("auxclick", (event) => {
+      if (event.button === 1) event.preventDefault();
+    });
+    canvas.addEventListener("pointerdown", (event) => {
+      if (
+        loading ||
+        !grid ||
+        (frames.current?.camera &&
+          frames.current?.camera.space !==
+            (solar.active ? "system" : "galaxy")) ||
+        (event.button !== undefined && event.button !== 0 && event.button !== 1)
+      )
+        return;
+      if (event.button === 1) event.preventDefault();
+      zoomMotion.cancel(camera.zoom);
+      const pan = solar.active ? solarTrackingPan : trackingPan;
+      drag = {
+        button: event.button || 0,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        x: solar.active ? solarCamera.x : camera.x,
+        y: solar.active ? solarCamera.y : camera.y,
+        panX: pan.x,
+        panY: pan.y,
+        context: viewContext(),
+        moved: false,
+      };
+      canvas.setPointerCapture?.(event.pointerId);
+    });
+    canvas.addEventListener("pointermove", (event) => {
+      if (!drag || loading || !grid) return;
+      const r = canvas.getBoundingClientRect(),
+        width = solar.active ? solarWidthAU() : (2 * grid.extent) / camera.zoom,
+        dx = event.clientX - drag.clientX,
+        dy = event.clientY - drag.clientY;
+      drag.moved ||= Math.abs(dx) + Math.abs(dy) > 3;
+      if (!drag.moved) return;
+      if (drag.button === 1 && (solar.active ? solarTracked : trackedId)) {
+        const pan = solar.active ? solarTrackingPan : trackingPan;
+        pan.x = drag.panX - dx * drag.context.worldPerCssPixel;
+        pan.y = drag.panY + dy * drag.context.worldPerCssPixel;
+        updateTracking();
+        observationKey = "";
+        dirty = true;
+        return;
+      }
+      if (solar.active) {
+        solarTracked = null;
+        Object.assign(solarTrackingPan, { x: 0, y: 0 });
+        solarCamera.x = drag.x - dx * drag.context.worldPerCssPixel;
+        solarCamera.y = drag.y + dy * drag.context.worldPerCssPixel;
+        observationKey = "";
+        dirty = true;
+        return;
+      }
+      stopTracking();
+      camera.x = Math.max(
+        -grid.extent,
+        Math.min(grid.extent, drag.x - dx * drag.context.worldPerCssPixel),
+      );
+      camera.y = Math.max(
+        -grid.extent,
+        Math.min(grid.extent, drag.y + dy * drag.context.worldPerCssPixel),
+      );
+      cameraControls();
+    });
+    canvas.addEventListener("pointerup", (event) => {
+      if (!drag) return;
+      const middle = drag.button === 1,
+        moved = drag.moved;
+      drag = null;
+      if (moved || loading || !grid) return;
+      const target = world(event);
+      if (solar.active) {
+        const picked = pickSolar(target);
+        if (middle && picked) {
+          if (picked.stellarNeighbor) {
+            $("referenceId").value = picked.id;
+            requestReference();
+            return;
+          }
+          solarTracked = picked.id;
+          Object.assign(solarTrackingPan, { x: 0, y: 0 });
+          updateSolarTracking();
+          dirty = true;
+        }
+        return;
+      }
+      const width =
+          presentedView?.width ?? viewContext(camera, false).worldSpan,
+        r = canvas.getBoundingClientRect();
+      let best = Infinity,
+        picked = null;
+      for (const p of lightStats?.drawn || []) {
+        const d =
+            (((p.x - target.x) / width) * Math.max(r.width, r.height)) ** 2 +
+            (((p.y - target.y) / width) * Math.max(r.width, r.height)) ** 2,
+          hitRadius = Math.max(
+            12,
+            (p.radiusPixels /
+              (frames.current?.context?.pixelSpan ?? canvas.width)) *
+              (frames.current?.camera.width / width) *
+              (presentedContext?.cssSpan ?? Math.max(r.width, r.height)),
+          );
+        if (d <= hitRadius * hitRadius && d < best) {
+          best = d;
+          picked = p;
+        }
+      }
+      if (picked) {
+        selected = picked.id;
+        showTab("object");
+        $("materialId").value = selected;
+        if (middle) {
+          trackedId = selected;
+          Object.assign(trackingPan, { x: 0, y: 0 });
+          updateTracking();
+        }
+        updateStarCard();
+        dirty = true;
+      }
+    });
+    canvas.addEventListener("pointercancel", () => {
+      drag = null;
+    });
+  }
+  bindCameraCanvas(canvas);
+  let viewportSignature = "",
+    renderSizeDirty = false;
+  const resizeViewport = () => {
+    const shape = screenShape(),
+      key = shape.aspectX + ":" + shape.aspectY + ":" + shape.size;
+    if (key !== viewportSignature) {
+      viewportSignature = key;
+      observationKey = "";
+      dirty = true;
+      renderSizeDirty = true;
+    }
+  };
+  if (globalThis.ResizeObserver)
+    new ResizeObserver(resizeViewport).observe(canvas.parentElement);
+  globalThis.addEventListener?.("resize", resizeViewport);
+  $("toggleFullscreen").addEventListener("click", async () => {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await canvas.parentElement.requestFullscreen();
+    } catch (error) {
+      $("toggleFullscreen").title =
+        "Plein écran indisponible : " + error.message;
+    }
+  });
+  document.addEventListener?.("fullscreenchange", () => {
+    const active = !!document.fullscreenElement;
+    $("toggleFullscreen").textContent = active
+      ? "⛶ Quitter le plein écran"
+      : "⛶ Plein écran";
+    $("toggleFullscreen").setAttribute("aria-pressed", String(active));
+    resizeViewport();
+  });
+
+  document.addEventListener?.("visibilitychange", () => {
+    lastWall = rateStamp = performance.now();
+    rateAnchor = clock.visible();
+    displayFPS.reset();
+    renderFPS.reset();
+  });
+  async function frame(timestamp) {
+    const token = generation,
+      now = Number.isFinite(timestamp) ? timestamp : performance.now(),
+      elapsed = Math.max(0, Math.min(250, now - lastWall));
+    lastWall = now;
+    try {
+      if (!loading && grid && !document.hidden) {
+        if (pendingReference) await processReference();
+        if (token !== generation) return;
+        if (running && (solar.active || solarLagNs === 0n)) clock.tick(elapsed);
+        const requested =
+            running || manual
+              ? Math.min(
+                  clock.duration(grid.isGPU ? 0.1 : 0.025),
+                  ((Number(rateCeiling) / Number(MODEL_NS)) * elapsed) / 1000,
+                )
+              : 0,
+          start = performance.now();
+        if (!solar.active && solarLagNs > 0n) {
+          physicsBusy = true;
+          const progress = grid.isGPU
+            ? await grid.advance(
+                Math.min(0.01, Number(solarLagNs) / Number(MODEL_NS)),
+                parameters(),
+              )
+            : grid.advance(
+                Math.min(0.01, Number(solarLagNs) / Number(MODEL_NS)),
+                parameters(),
+              );
+          if (token !== generation) return;
+          const consumed = BigInt(
+            Math.round(progress.advanced * Number(MODEL_NS)),
+          );
+          solarLagNs = solarLagNs > consumed ? solarLagNs - consumed : 0n;
+          revision++;
+          lastCost = performance.now() - start;
+          lastSteps = progress.steps;
+          lastAdvanced = progress.advanced;
+          refresh();
+        } else if (solar.active && requested > 0) {
+          physicsBusy = true;
+          const before = clock.integrated,
+            progress = await solar.advance(requested * 1e6);
+          if (token !== generation) return;
+          clock.consume(progress.advanced / 1e6);
+          solarLagNs += clock.integrated - before;
+          if (solar.active) {
+            solar.active.epochNs = clock.integrated;
+            solar.save();
+          }
+          revision++;
+          lastCost = performance.now() - start;
+          lastSteps = progress.steps;
+          lastAdvanced = progress.advanced / 1e6;
+          dirty = true;
+        } else if (requested > 0) {
+          physicsBusy = true;
+          const duration = Math.min(
+              requested,
+              localDynamics?.stepLimit || Infinity,
+            ),
+            progress = grid.isGPU
+              ? await grid.advance(duration, parameters())
+              : grid.advance(duration, parameters());
+          if (token !== generation) return;
+          clock.consume(progress.advanced);
+          revision++;
+          lastCost = performance.now() - start;
+          lastSteps = progress.steps;
+          lastAdvanced = progress.advanced;
+          refresh();
+        }
+        physicsBusy = false;
+        if (manual && clock.duration() === 0) {
+          manual = false;
+          $("pause").textContent = "Reprendre";
+        }
+        updateTracking();
+        await observe();
+        if (token === generation && (dirty || running || manual)) draw();
+      }
+    } catch (error) {
+      if (token === generation) {
+        running = manual = false;
+        $("pause").textContent = "Reprendre";
+        $("backendStatus").textContent = "Calcul arrêté : " + error.message;
+      }
+    } finally {
+      if (token === generation) physicsBusy = false;
+      requestAnimationFrame(frame);
+    }
+  }
+
+  requestAnimationFrame(animate);
+  applyStellarOptics();
+  updateAdaptiveControls();
+  speedChanged();
+  cameraControls();
+  reset().then(async () => {
+    const previewTime = Math.min(
+      0.5,
+      Math.max(
+        0,
+        Number(new URLSearchParams(location.search).get("time")) || 0,
+      ),
+    );
+    for (let i = 0; i < Math.round(previewTime / 0.01); i++) {
+      const progress = await grid.advance(0.01, parameters());
+      clock.consume(progress.advanced);
+      revision++;
+    }
+    if (previewTime) {
+      refresh();
+      await observe(true);
+      draw();
+    }
+    lastWall = performance.now();
+    requestAnimationFrame(frame);
+  });
 })();

@@ -1,0 +1,33 @@
+'use strict';
+const assert = require('node:assert/strict');
+const { FramePublication, cameraPresentation } = require('./src/observation/camera-frame');
+
+const publication = new FramePublication();
+assert.equal(publication.current, null);
+const camera = {space:'system', originX:0, originY:0, modelLengthPc:10000, unitPc:1, x:2, y:3, width:10, follow:{id:'body',x:2,y:3}};
+const context = Object.freeze({pixelSpan:600});
+const points = [{id:'body',x:2,y:3}];
+const projection = {image:new Float64Array(16)};
+const solarScene = {hostId:'host',entries:points};
+const frame = publication.publish({camera,context,points,projection,solarScene,revision:7});
+// Mutating live navigation cannot alter the coordinates of a published image.
+camera.x = 100;
+camera.follow.x = 200;
+assert.equal(frame.camera.x, 2);
+assert.equal(frame.camera.follow.x, 2);
+assert(Object.isFrozen(frame) && Object.isFrozen(frame.camera) && Object.isFrozen(frame.camera.follow));
+assert.equal(frame.context, context);
+assert.equal(frame.points, points, 'large buffers are borrowed without copying');
+assert.equal(frame.projection.image, projection.image);
+assert.equal(frame.solarScene, solarScene);
+assert.equal(frame.revision, 7);
+const transform = cameraPresentation(frame.camera, frame.camera, 600);
+assert.equal(transform.scale, 1);
+assert.equal(Math.abs(transform.x) + Math.abs(transform.y), 0);
+const next = publication.publish({...frame,revision:8,points:[]});
+assert.equal(publication.current, next);
+assert.equal(frame.points, points, 'replacing the current image does not mutate an older image');
+publication.clear();
+assert.equal(publication.current, null);
+assert.equal(frame.revision, 7);
+console.log('Passed: atomic frame publication, immutable camera metadata, borrowed buffers and reset.');
