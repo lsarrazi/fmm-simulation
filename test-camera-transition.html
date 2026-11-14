@@ -1,0 +1,34 @@
+<!doctype html><meta charset="utf-8"><title>Atomic camera transition</title><iframe id="app" src="comparison.html" width="1500" height="1000"></iframe><pre id="output">RUNNING</pre><script>
+const sleep=ms=>new Promise(r=>setTimeout(r,ms)),wait=async f=>{for(let i=0;i<500;i++){if(f())return;await sleep(40);}throw Error('Timed out');};
+(async()=>{try{
+ await wait(()=>app.contentDocument?.getElementById('continuous')?.getAttribute('data-render-backend')==='GPU');
+ const w=app.contentWindow,d=app.contentDocument,$=id=>d.getElementById(id),canvas=()=>$('continuous'),AU=w.PlanetarySystems.AU_PC;
+ $('planetaryEnabled').checked=false;$('planetaryEnabled').dispatchEvent(new Event('change'));$('systemMask').checked=false;$('followStar').click();const host=$('materialId').value;$('trackStar').click();
+ const fullAU=Number($('cameraHeight').value)*2*Math.tan(Number($('cameraFov').value)*Math.PI/360)*Number($('zoomValue').value)/AU;
+ const zoom=width=>{$('zoomValue').value=String(fullAU/width);$('zoomValue').dispatchEvent(new Event('change'));};
+ zoom(11000);await wait(()=>canvas().getAttribute('data-zoom-animating')==='false'&&Number(canvas().getAttribute('data-optical-zoom'))>fullAU/11001);
+ const drag=(dx,dy)=>{const b=canvas().getBoundingClientRect(),x=b.left+b.width/2,y=b.top+b.height/2;for(const [type,px,py]of [['pointerdown',x,y],['pointermove',x+dx,y+dy],['pointerup',x+dx,y+dy]])canvas().dispatchEvent(new w.PointerEvent(type,{clientX:px,clientY:py,button:1,buttons:type==='pointerup'?0:4,pointerId:8,bubbles:true}));};
+ drag(65,-35);await sleep(100);let expectedX=Number(canvas().getAttribute('data-tracking-offset-x'))*10000,expectedY=Number(canvas().getAttribute('data-tracking-offset-y'))*10000;
+ if(!expectedX||!expectedY)throw Error('Fixture must be off centre');
+ const samples=[],failures=[],present=w.cameraPresentation;
+ w.cameraPresentation=function(image,view,size){const t=present(image,view,size),x=view.x*view.unitPc,y=view.y*view.unitPc;if(image.follow?.id===host&&view.follow?.id===host){const actualX=(image.follow.x-image.x)/image.width*t.scale+t.x/size,actualY=-(image.follow.y-image.y)/image.width*t.scale+t.y/size,targetX=-x/(view.width*view.unitPc),targetY=y/(view.width*view.unitPc);if(Math.abs(actualX-targetX)>1e-7||Math.abs(actualY-targetY)>1e-7)failures.push({actualX,actualY,targetX,targetY,image:image.space,view:view.space});}samples.push({image:image.space,view:view.space,t});return t;};
+ const create=w.createOrbitGPUOrbitSystem;let preparations=0;
+ w.createOrbitGPUOrbitSystem=async function(options){preparations++;await sleep(400);return create(options);};
+ $('planetaryEnabled').checked=true;$('planetaryEnabled').dispatchEvent(new Event('change'));await wait(()=>preparations===1);await sleep(70);
+ const b=canvas().getBoundingClientRect();expectedX-=20/Math.min(b.width,b.height)*11000*AU;expectedY+=10/Math.min(b.width,b.height)*11000*AU;drag(20,10);
+ await wait(()=>canvas().getAttribute('data-system-host')===host);await sleep(100);
+ // Orbit labels and imagery must use the same logarithmic zoom on every frame.
+ let holdObservation=true;const activate=w.PlanetarySystems.Manager.prototype.activate;w.PlanetarySystems.Manager.prototype.activate=async function(...args){if(holdObservation)await sleep(90);return activate.apply(this,args);};$('systemGuides').checked=true;const first=w.PlanetarySystems.describe(host).seeds[0];if(!first)throw Error('Orbit fixture needs a planet');let overlayFrames=0,overlayFailure=null;
+ const monitor=()=>{if(canvas().getAttribute('data-system-host')===host){const ellipse=$('systemOverlay').querySelector('ellipse'),width=fullAU/Number(canvas().getAttribute('data-optical-zoom'));if(ellipse){const expected=first.a/width*Math.min(canvas().getBoundingClientRect().width,canvas().getBoundingClientRect().height),actual=Number(ellipse.getAttribute('rx'));if(Math.abs(actual/expected-1)>1e-6)overlayFailure={actual,expected};overlayFrames++;}}};
+ zoom(5000);for(let i=0;i<25;i++){await new Promise(r=>w.requestAnimationFrame(r));monitor();}zoom(11000);for(let i=0;i<25;i++){await new Promise(r=>w.requestAnimationFrame(r));monitor();}if(overlayFailure)throw Error('Log zoom overlay lag '+JSON.stringify(overlayFailure));if(overlayFrames<10)throw Error('Not enough zoom frames');holdObservation=false;
+ // Hold the old system HDR image while the next galactic observation waits.
+ const prepare=w.LocalStellarDynamics.prototype.prepare;let localWait=false;
+ w.LocalStellarDynamics.prototype.prepare=async function(...args){if(localWait)await sleep(180);return prepare.apply(this,args);};
+ localWait=true;zoom(30000);await wait(()=>canvas().getAttribute('data-system-host')===''&&canvas().getAttribute('data-zoom-animating')==='false');await sleep(250);
+ if(!samples.some(p=>p.image==='system'))throw Error('No system frame was exercised');
+ localWait=false;$('planetaryEnabled').checked=false;zoom(11000);await wait(()=>canvas().getAttribute('data-zoom-animating')==='false');$('planetaryEnabled').checked=true;await wait(()=>preparations===2);zoom(30000);await sleep(1000);
+ if(canvas().getAttribute('data-system-host')!=='')throw Error('Abandoned activation committed after zoom-out');
+ if(failures.length)throw Error('Transient recentering: '+JSON.stringify(failures.slice(0,3)));
+ output.textContent='PASS '+JSON.stringify({offCenterEntry:true,panDuringGPUPreparation:true,staleFrameExit:true,cancelledEntry:true,synchronizedZoomOverlays:true,presentationFrames:samples.length});
+}catch(e){output.textContent='FAIL '+e.stack;}await fetch('/result',{method:'POST',body:output.textContent});})();
+</script>

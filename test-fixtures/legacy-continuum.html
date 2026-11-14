@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#07090e"><title>Orbit — Matière continue</title>
+  <link rel="stylesheet" href="fmm.css">
+  <style>
+    [hidden]{display:none!important} .hero{align-items:start} .stage{position:sticky;top:20px;height:78vh;min-height:500px;max-height:850px} #matter{width:100%;height:100%;position:absolute;inset:0;cursor:crosshair;touch-action:none}
+    .panel{overflow:auto} .controls{gap:15px} .stat-grid{margin:18px 0} .intro a,.formula-help a{color:#d7ff52}
+    select{width:100%} .control-row{display:grid;gap:7px} .matter-note{font:11px/1.6 sans-serif;color:#a1a9b7}
+    .matter-status{padding:10px;border:1px solid #303846;color:#a9d9c8;font:11px/1.5 sans-serif}
+    .legend{position:absolute;bottom:22px;left:22px;max-width:calc(100% - 44px);background:#07090ed9;padding:10px 14px;color:#a3b0c7;font:11px/1.5 sans-serif;pointer-events:none}
+    .legend i{display:inline-block;width:90px;height:7px;margin-right:8px;background:linear-gradient(90deg,#090f22,#2779b5,#8de1da,#ffecaa)}
+    .sample-controls{display:grid;gap:12px;padding:14px 0;border-block:1px solid #303846;font-size:11px}.sample-controls label{display:block;color:#b7bdc8;margin-bottom:5px}.sample-controls input[type=text]{width:100%;padding:8px;background:#090d17;color:#d7ff52;border:1px solid #303846}.sample-controls select{padding:7px;background:#090d17;color:#e8ebdf;border:1px solid #303846}
+    #identityDetail{display:block;white-space:pre-wrap;overflow-wrap:anywhere;color:#a9d9c8;font:11px/1.6 monospace}.sample-buttons{display:flex;gap:6px;flex-wrap:wrap}.sample-buttons button{padding:7px;background:#151c28;border:1px solid #374153;cursor:pointer}.legend{z-index:2}.legend span{color:#d7ff52}
+    #sampleStatus{overflow-wrap:anywhere}.eyebrow{max-width:calc(100% - 44px);line-height:1.5}.panel>.actions{margin:0 0 16px;padding:0}
+    @media(max-width:920px){.stage{position:relative;top:0;min-height:65vh;height:65vh}}
+  </style>
+</head>
+<body><main class="shell">
+  <header><div class="brand"><strong>ORBIT</strong><span>MATIÈRE / CONTINU</span></div><div class="complexity"><span>DISTRIBUTION CINÉTIQUE</span><b>4D</b></div></header>
+  <section class="hero">
+    <div class="stage"><div class="eyebrow">NUAGE SANS ROTATION IMPOSÉE · GRAVITÉ</div>
+      <canvas id="matter" aria-label="Densité de surface d’un nuage de matière continue"></canvas>
+      <div class="legend"><i></i>Densité faible → forte<br><span>Déplacer : observer · clic : fixer la zone / choisir un témoin</span><br>Points = témoins sans masse ajoutée · cercle = région observée</div>
+    </div>
+    <aside class="panel">
+      <h1>Matter.<em>In motion.</em></h1>
+      <p class="intro">Un nuage continu sans rotation imposée. Des identités virtuelles peuvent être interrogées à la demande. <a href="index.html">Revenir au mode N-corps</a></p>
+      <p class="intro"><a href="comparison.html" style="color:var(--acid)">Comparer N-corps et continu →</a><br>Même scénario initial · deux solveurs côte à côte</p>
+<div class="actions"><button id="reset" class="action">Réinitialiser</button><button id="pause" class="action primary" aria-pressed="false">Pause</button></div>
+      <div class="sample-controls">
+        <div><label for="population">Population théorique (après réinitialisation)</label><select id="population"><option value="6">10⁶ · un million</option><option value="9">10⁹ · un milliard</option><option value="12">10¹² · un billion</option><option value="18">10¹⁸ · un trillion</option><option value="21">10²¹ · un trilliard</option><option value="24" selected>10²⁴</option><option value="60">10⁶⁰</option></select></div>
+        <label><input id="sampleEnabled" type="checkbox" checked> Afficher les témoins locaux</label>
+        <div><label for="probes">Budget de recherche, indépendant de la population</label><select id="probes"><option value="256">256 témoins</option><option value="768" selected>768 témoins</option><option value="2048">2 048 témoins</option></select></div>
+        <div><div class="control-head"><label for="observationRadius">Rayon observé</label><output id="observationRadiusValue">0.40</output></div><input id="observationRadius" type="range" min="0.15" max="1" value="0.4" step="0.05"></div>
+        <div class="sample-buttons"><button id="unlockObservation" type="button">Suivre le pointeur</button><button id="forget" type="button">Vider le cache des identités</button></div>
+        <p id="sampleStatus" class="matter-note" aria-live="off">Préparation des identités…</p>
+        <div><label for="identityInput">Interroger un identifiant exact, de 0 à N−1</label><input id="identityInput" type="text" inputmode="numeric" maxlength="80" value="0"></div>
+        <div class="sample-buttons"><button id="findIdentity" type="button">Retrouver</button><button id="rebuildIdentity" type="button">Reconstruire depuis l’origine</button></div>
+        <output id="identityDetail" aria-live="polite">Cliquez sur un point ou recherchez un identifiant.</output>
+        <p class="formula-help">Échantillon borné de témoins : tous les individus locaux ne sont pas énumérés. Leur identité est exacte ; leur parcours suit le transport probabiliste et diffusif de la grille. Persistance pendant cette expérience ; Réinitialiser recrée l’expérience. Aucun témoin n’ajoute de masse.</p>
+      </div>
+      <div class="stat-grid">
+        <div class="stat"><label>MASSE PRÉSENTE</label><output id="massStat">—</output></div>
+        <div class="stat"><label>TEMPS SIMULÉ</label><output id="timeStat">0</output></div>
+        <div class="stat"><label>SORTIE SPATIALE</label><output id="spaceLoss">—</output></div>
+        <div class="stat"><label>SORTIE EN VITESSE</label><output id="velocityLoss">—</output></div>
+        <div class="stat"><label>MOMENT ANGULAIRE</label><output id="angularStat">—</output></div>
+        <div class="stat"><label>CALCUL / IMAGE</label><output id="timing">—</output></div>
+      </div>
+      <div class="controls">
+        <div class="select-control"><label for="resolution">Résolution positions × vitesses</label><select id="resolution"><option value="20,21">20² × 21² · rapide</option><option value="28,25" selected>28² × 25² · équilibrée</option><option value="36,33">36² × 33² · détaillée</option></select></div>
+        <div class="select-control"><label for="initial">Vitesses initiales</label><select id="initial"><option value="warm">Aléatoires isotropes · moyenne nulle</option><option value="cold">Matière froide · au repos</option></select></div>
+        <div class="control-row"><div class="control-head"><label for="sigma">Agitation initiale σ</label><output id="sigmaValue">0.15</output></div><input id="sigma" type="range" min="0.05" max="0.6" value="0.15" step="0.01"></div>
+        <div class="control-row"><div class="control-head"><label for="fluctuation">Fluctuations de densité</label><output id="fluctuationValue">20 %</output></div><input id="fluctuation" type="range" min="0" max="0.9" value="0.2" step="0.05"></div>
+        <div class="control-row"><div class="control-head"><label for="radius">Rayon initial du nuage</label><output id="radiusValue">0.85</output></div><input id="radius" type="range" min="0.35" max="1.2" value="0.85" step="0.05"></div>
+        <div class="control-row"><div class="control-head"><label for="gravity">Gravité G</label><output id="gravityValue">0.48</output></div><input id="gravity" type="range" min="0" max="1" value="0.48" step="0.01"></div>
+        <div class="control-row"><div class="control-head"><label for="softening">Adoucissement ε</label><output id="softeningValue">0.12</output></div><input id="softening" type="range" min="0.08" max="0.3" value="0.12" step="0.01"></div>
+        <div class="control-row"><div class="control-head"><label for="speed">Vitesse temporelle</label><output id="speedValue">1.0×</output></div><input id="speed" type="range" min="0.2" max="3" value="1" step="0.1"></div>
+        <div class="select-control"><label for="vmax">Domaine des vitesses, par axe</label><select id="vmax"><option value="2" selected>−2 à +2</option><option value="4">−4 à +4 · vitesses plus grossières</option></select></div>
+      </div>
+      <p id="pending" class="matter-note" hidden>Conditions initiales modifiées : cliquez sur Réinitialiser.</p>
+      <p id="status" class="matter-status" role="status">Initialisation…</p>
+      <p class="formula-help">Unités réduites · masse initiale = 1. Matière sans collisions ; aucune force électromagnétique dans ce prototype. La grille introduit une diffusion numérique : les petites structures sont approximatives. Une sortie en vitesse importante indique un domaine insuffisant.</p>
+    </aside>
+  </section>
+  <section class="method" aria-label="Principe du modèle">
+    <article><b>01 / DISTRIBUTION</b><strong>f(x, y, vx, vy)</strong><p>Chaque case représente une quantité de matière, avec plusieurs vitesses possibles au même endroit.</p></article>
+    <article><b>02 / DENSITÉ</b><strong>Projection spatiale</strong><p>La somme sur les vitesses donne la densité de surface visible.</p></article>
+    <article><b>03 / CHAMP</b><strong>Gravité propre</strong><p>Intégration du noyau newtonien adouci sur les cellules spatiales.</p></article>
+    <article><b>04 / TRANSPORT</b><strong>Évolution cinétique</strong><p>Transport conservatif sur la grille ; frontières absorbantes et masse sortante mesurée.</p></article>
+  </section>
+</main><script src="continuum-solver.js?v=2"></script><script src="continuum-identities.js?v=1"></script><script src="continuum-view.js?v=2"></script></body></html>

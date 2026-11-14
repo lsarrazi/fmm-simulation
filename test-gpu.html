@@ -1,0 +1,42 @@
+<!doctype html><meta charset="utf-8"><title>GPU validation</title><pre id="output">RUNNING</pre>
+<script src="continuum-solver.js"></script><script src="fmm-core.js"></script><script src="stellar-population.js"></script><script src="milky-way.js"></script><script src="galaxy-comparison.js"></script><script src="continuum-gpu.js"></script>
+<script>
+(async()=>{let gpu;try{
+ const bodies=initialBodies(128),cpu=new TVDMatter({n:8,nv:9});cpu.load(bodies);
+ gpu=await GPUKineticMatter.create({n:8,nv:9,bodies});
+ const compare=(a,b)=>a.reduce((sum,v,i)=>sum+Math.abs(v-b[i]),0);
+ let snapshot=await gpu.snapshot();const initial=compare(snapshot,cpu.f);
+ if(initial>2e-6)throw Error('Initial mismatch '+initial);
+ for(let i=0;i<5;i++){cpu.advance(.01,{gravity:0});await gpu.advance(.01,{gravity:0});}
+ snapshot=await gpu.snapshot();const transport=compare(snapshot,cpu.f);
+ if(transport>1e-5)throw Error('Transport mismatch '+transport);
+ if(snapshot.some(v=>!Number.isFinite(v)||v< -1e-10))throw Error('Invalid distribution');
+ if(Math.abs(gpu.diagnostics().mass+gpu.spatialLoss+gpu.velocityLoss-1)>2e-5)throw Error('Mass balance');
+ await gpu.advance(.01,{gravity:.48,softening:.042});
+ cpu.field=KineticMatter.prototype.field;cpu.advance(.01,{gravity:.48,softening:.042});
+ const gravityError=compare(await gpu.snapshot(),cpu.f);if(gravityError>.003)throw Error('Gravity mismatch '+gravityError);
+ const full=await gpu.snapshot(),local=await gpu.readLocalPhase([0,11]);for(const cell of [0,11])if(compare(local.get(cell),full.subarray(cell*81,(cell+1)*81))!==0)throw Error('Local phase query mismatch');
+ const timeBefore=gpu.time;await gpu.advance(1e-6,{gravity:0});if(Math.abs(gpu.time-timeBefore-1e-6)>1e-12)throw Error('Slow numerical timestep');
+ const d=gpu.diagnostics();if(!Number.isFinite(d.angularMomentum)||Math.abs(d.mass+d.spatialLoss+d.velocityLoss-1)>2e-5)throw Error('Gravity diagnostics');
+ gpu.destroy();gpu=await GPUKineticMatter.create({n:64,nv:33,bodies:initialBodies(2048)});
+ const start=performance.now();await gpu.advance(.01,{gravity:.48,softening:.042});
+ const large=gpu.diagnostics();if(Math.abs(large.mass+large.spatialLoss+large.velocityLoss-1)>5e-5)throw Error('Large grid mass balance');
+ const reports=[{n:64,nv:33,ms:performance.now()-start,mass:large.mass}];
+ for(const[n,nv]of [[128,33],[128,65],[256,33]]){
+  gpu.destroy();gpu=null;
+  try{gpu=await GPUKineticMatter.create({n,nv,bodies:initialBodies(2048)});}catch(e){if(e.message.startsWith('Grille trop grande')){reports.push({n,nv,unsupported:e.message});continue;}throw e;}
+  const stamp=performance.now();await gpu.advance(.01,{gravity:.48,softening:.042});const diagnostics=gpu.diagnostics();
+  if(Math.abs(diagnostics.mass+gpu.spatialLoss+gpu.velocityLoss-1)>1e-4)throw Error('High resolution mass balance');
+  reports.push({n,nv,ms:performance.now()-stamp,mass:diagnostics.mass,time:diagnostics.time});
+ }
+ gpu.destroy();const mw=initialBodies(512,'milkyway'),mc=new TVDMatter({n:32,nv:33,...mw.physics});mc.load(mw);
+ gpu=await GPUKineticMatter.create({n:32,nv:33,bodies:mw,...mw.physics,physics:mw.physics});
+ const analyticError=compare(await gpu.snapshot(),mc.f);if(analyticError>2e-5)throw Error('MW analytic initialization mismatch '+analyticError);
+ mc.advance(.01,mw.physics);await gpu.advance(.01,mw.physics);const mwError=compare(await gpu.snapshot(),mc.f);if(mwError>.003)throw Error('MW halo or velocity calibration mismatch '+mwError);
+ const initialShape=gpu.mass.slice();while(gpu.time<20-1e-9)await gpu.advance(Math.min(1,20-gpu.time),mw.physics);
+ const evolution=compare(initialShape,gpu.mass)/2,finalMW=gpu.diagnostics();if(evolution<.02)throw Error('Structured galaxy is not dynamically evolving '+evolution);
+ if(Math.abs(finalMW.mass+gpu.spatialLoss+gpu.velocityLoss-1)>1e-4)throw Error('MW evolution mass balance');
+ if((await gpu.snapshot()).some(v=>!Number.isFinite(v)||v<0))throw Error('Invalid evolved MW phase distribution');
+ output.textContent='PASS '+JSON.stringify({initialL1:initial,transportL1:transport,gravityL1:gravityError,mwAnalyticL1:analyticError,mwStepL1:mwError,mwDensityChange20Myr:evolution,mwMass20Myr:finalMW.mass,reports,adapter:'WebGPU matériel'});
+ }catch(e){output.textContent='FAIL '+e.stack;}finally{gpu?.destroy();if(location.protocol==='http:')await fetch('/result',{method:'POST',body:output.textContent});}})();
+</script>

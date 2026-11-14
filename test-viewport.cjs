@@ -1,0 +1,8 @@
+const assert=require('node:assert/strict'),{viewportGeometry,viewportProjection}=require('./observation-tools'),Matter=require('./persistent-matter'),Light=require('./stellar-light');
+for(const [w,h]of [[1600,900],[900,1600],[600,600],[390,520]]){const v=viewportGeometry(w,h);assert(Math.abs(v.pixelWidth/v.pixelHeight-w/h)<.003);assert.equal(Math.max(v.aspectX,v.aspectY),1);assert.equal(v.size,Math.max(w,h));assert(Math.abs(v.referenceWidth/v.referenceHeight-w/h)<1e-12);}
+const field={resolution:10,width:2,image:new Float64Array(100).fill(.01)};assert(Math.abs(viewportProjection(field,1,.5).viewMass-.5)<1e-12);
+const grid={n:4,nv:1,dx:1,dv:1,extent:2,initialPhase:[[5,1]]},m=new Matter(grid,{population:1024n});const all=m.sample({budget:8192,exact:true});for(const [aspectX,aspectY]of [[1,.5],[.5,1],[.2,1]]){const rect=m.sample({budget:8192,exact:true,aspectX,aspectY}),expected=all.points.filter(p=>Math.abs(p.x)<=2*aspectX&&Math.abs(p.y)<=2*aspectY);assert.deepEqual(rect.points.map(p=>p.id).sort(),expected.map(p=>p.id).sort());assert.equal(rect.estimated,BigInt(expected.length));}
+assert.equal(Light.surfaceVisibility(.1,1),0,'subpixel bodies use guides, not a false solid disk');assert.equal(Light.surfaceVisibility(2,1),1);
+console.log('Passed: landscape/portrait pixel geometry, visible PDF mass, exact rectangular inferred identities and physical surface visibility.');
+
+for(const [w,h,dpr]of [[1920,1080,1],[1920,1080,2],[3840,2160,1],[901,1601,2]]){const v=viewportGeometry(w,h,{pixelRatio:dpr});assert.equal(v.pixelWidth,w*dpr);assert.equal(v.pixelHeight,h*dpr);assert.equal(v.size,Math.max(w,h)*dpr);}assert.equal(viewportGeometry(10000,5000,{pixelRatio:2,maxDimension:8192}).size,8192);

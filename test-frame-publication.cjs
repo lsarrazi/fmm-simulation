@@ -1,0 +1,7 @@
+const assert=require('node:assert/strict'),{cameraPresentation,committedCameraView}=require('./observation-tools'),AU=1/206264.80624709636;
+const image={space:'system',referenceId:'host',originX:.83,originY:-.17,modelLengthPc:10000,unitPc:AU,x:2,y:-3,width:10,follow:null};
+for(const drift of [1,-1,100,-100]){const live={...image,originX:image.originX+drift*AU/10000};assert.deepEqual(cameraPresentation(image,committedCameraView(image,live),600),{scale:1,x:0,y:-0},'a cached local image cannot drift with the live host');}
+for(const space of ['system','galaxy']){const base={...image,space,unitPc:space==='system'?AU:10000,follow:{id:'body',x:2,y:-3}};for(const drift of [0,1,2,-1]){const live={...base,x:2+drift,y:-3,follow:{id:'body',x:2+drift,y:-3}};const stable=committedCameraView(base,live);assert.deepEqual(cameraPresentation(base,stable,600),{scale:1,x:0,y:-0},'physics publication cannot move an older tracked image');const panned=committedCameraView(base,live,{x:1,y:2});const t=cameraPresentation(base,panned,600);assert(Math.abs(t.x+60)<1e-10);assert(Math.abs(t.y-120)<1e-10);}}
+const galaxy={...image,space:'galaxy',unitPc:10000,referenceId:null};const live={...galaxy,originX:galaxy.originX+.1,x:galaxy.x-.1};const t=cameraPresentation(galaxy,committedCameraView(galaxy,live),600);assert(Math.abs(t.x)<1e-12,'free galactic camera keeps world coordinates through origin changes');
+console.log('Passed: immutable presentation during host motion, forward/backward fine-time changes, tracked and free cameras, live pan and world-coordinate rebasing.');
+

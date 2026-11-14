@@ -1,0 +1,19 @@
+<!doctype html><meta charset="utf-8"><title>Live reference field</title><iframe id="app" src="comparison.html" width="1500" height="1000"></iframe><pre id="output">RUNNING</pre><script>
+const wait=async f=>{for(let i=0;i<400;i++){if(f())return;await new Promise(r=>setTimeout(r,50));}throw Error('Timed out');};
+(async()=>{try{
+ await wait(()=>app.contentDocument?.getElementById('continuous')?.getAttribute('data-render-backend')==='GPU');
+ const d=app.contentDocument,$=id=>d.getElementById(id),active=()=>$('referenceControl').getAttribute('data-reference-id'),input=$('referenceId');
+ function enter(value){input.focus();input.value=value;input.dispatchEvent(new Event('input'));input.dispatchEvent(new app.contentWindow.KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));}
+ function escape(){input.dispatchEvent(new app.contentWindow.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));}
+ if(!$('simulationBar').contains(input))throw Error('Reference field is not in permanent simulation bar');
+ $('followStar').click();const host=$('materialId').value;enter(host);await wait(()=>active()===host&&input.value===host);if(!$('referenceStatus').textContent.includes($('starName').textContent))throw Error('Tracked star name absent');
+ enter('invalid-reference');await wait(()=>input.getAttribute('aria-invalid')==='true');if(active()!==host)throw Error('Invalid identity altered reference');escape();if(input.value!==host)throw Error('Escape did not restore current ID');
+ $('visitSystem').click();await wait(()=>$('continuous').getAttribute('data-system-host')===host);const body=host+'/system/v2/body/0';enter(body);await wait(()=>active()===body&&$('systemBodyId').value===body);if(input.value!==body)throw Error('Body identity not displayed');
+ input.value='draft/reference';input.dispatchEvent(new Event('input'));$('pause').click();await new Promise(r=>setTimeout(r,600));$('pause').click();if(input.value!=='draft/reference'||active()!==body)throw Error('Simulation overwrote an edited reference');escape();if(input.value!==body)throw Error('Body ID not restored');
+ enter('123456');const asteroid=host+'/system/v2/body/123456';await wait(()=>active()===asteroid&&input.value===asteroid);
+ const parts=host.split('/'),otherHost=parts.slice(0,-1).join('/')+'/'+(BigInt(parts.at(-1))+1n),otherBody=otherHost+'/system/v2/body/123457';enter(otherBody);await wait(()=>active()===otherBody&&$('continuous').getAttribute('data-system-host')===otherHost);if($('continuous').getAttribute('data-system-tracked')!==otherBody)throw Error('Cross-system identity did not become tracked object');
+ enter(otherHost+'/system/v2/body/999999999999999999999999999999');await wait(()=>input.getAttribute('aria-invalid')==='true');if(active()!==otherBody)throw Error('Out-of-range identity changed system');escape();
+ enter(host);await wait(()=>active()===host);$('releaseReference').click();await wait(()=>active()===''&&input.value==='');if($('referenceStatus').textContent!=='Caméra libre')throw Error('Free reference status absent');
+ output.textContent='PASS '+JSON.stringify({permanentReferenceField:true,starFollow:true,bodyFollow:true,rankCanonicalisation:true,crossSystemFollow:true,draftPreservedWhileRunning:true,invalidIdPreservesTarget:true,escapeRestoresId:true,freeCamera:true});
+}catch(e){output.textContent='FAIL '+e.stack+' '+app.contentDocument?.getElementById('backendStatus')?.textContent+' '+app.contentDocument?.getElementById('referenceStatus')?.textContent;}await fetch('/result',{method:'POST',body:output.textContent});})();
+</script>

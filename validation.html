@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#07090e" />
+  <title>Orbit — Fast Multipole Method</title>
+  <link rel="stylesheet" href="fmm.css" />
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div class="brand"><strong>ORBIT</strong><span>LAB / 02D</span></div>
+      <div class="complexity"><span>FAST MULTIPOLE METHOD</span><b>O(N)</b></div>
+    </header>
+
+    <section class="hero" aria-label="Simulation N-corps">
+      <div class="stage">
+        <div class="eyebrow">CHAMP GRAVITATIONNEL · TEMPS RÉEL</div>
+        <canvas id="gpuSpace" aria-hidden="true"></canvas>
+        <canvas id="space" aria-label="Simulation animée d'un système gravitationnel à N corps"></canvas>
+        <div class="hint">CLIC / TOUCHER · AJOUTER UNE PERTURBATION</div>
+      </div>
+
+      <aside class="panel">
+        <h1>Many bodies.<em>One field.</em></h1>
+        <p class="intro">Les interactions lointaines sont condensées en multipôles. Les voisines restent calculées directement.</p>
+
+        <div class="stat-grid">
+          <div class="stat"><label>CORPS</label><output id="bodyStat">512</output></div>
+          <div class="stat"><label>FPS</label><output id="fpsStat">—</output></div>
+          <div class="stat"><label>CELLULES FMM</label><output id="cellStat">—</output></div>
+          <div class="stat"><label>FMM / RENDU</label><output id="timingStat">—</output></div>
+          <div class="stat"><label>VS N LOG₂N</label><output id="nlogStat">—</output></div>
+          <div class="stat"><label>VS N²</label><output id="gainStat">—</output></div>
+        </div>
+        <p class="metric-note">Rapports algorithmiques = travail du modèle de référence ÷ travail FMM borné. En mode Compute, le temps GPU inclut calcul, intégration et rendu.</p>
+
+        <p class="intro"><a href="comparison.html" style="color:var(--acid)">Ouvrir Galaxy Workspace →</a><br>Application principale · observation à deux échelles</p>
+        <div class="controls">
+          <div>
+            <div class="control-head"><label for="count">Nombre de corps</label><output id="countValue">512</output></div>
+            <input id="count" type="range" min="7" max="25.575" step="0.025" value="9" aria-describedby="countHelp" />
+            <small id="countHelp" class="scale-note">Échelle logarithmique · CPU 262 144 · GPU Compute jusqu’à 50 millions</small>
+          </div>
+          <div>
+            <div class="control-head"><label for="speed">Vitesse temporelle</label><output id="speedValue">1.0×</output></div>
+            <input id="speed" type="range" min="0.2" max="2" step="0.1" value="1" />
+          </div>
+          <div>
+            <div class="control-head"><label for="zoom">Zoom caméra</label><output id="zoomValue">1.00×</output></div>
+            <input id="zoom" type="range" min="-2" max="4" step="0.05" value="0" />
+            <small class="scale-note">De 0,25× à 16× · molette sur la simulation</small>
+          </div>
+          <div>
+            <div class="control-head"><label for="accuracy">Développement local</label><output id="accuracyValue">p = 1</output></div>
+            <input id="accuracy" type="range" min="0" max="1" step="1" value="1" />
+          </div>
+          <div class="select-control">
+            <label for="boundary">Frontière de l’espace</label>
+            <select id="boundary">
+              <option value="open">Ouverte</option>
+              <option value="reflect">Réfléchissante</option>
+              <option value="torus">Tore périodique</option>
+            </select>
+          </div>
+          <div class="select-control">
+            <label for="renderer">Mode de rendu</label>
+            <select id="renderer">
+              <option value="cpu">CPU · Canvas</option>
+              <option value="gpu">GPU · rendu seul</option>
+              <option value="gpu-compute">GPU Compute · FMM + rendu</option>
+            </select>
+            <output id="rendererStatus" class="renderer-status">Canvas 2D actif</output>
+          </div>
+          <details class="mass-editor" open>
+            <summary>Distribution des masses</summary>
+            <label class="field-label" for="density">Densité f(m)</label>
+            <input id="density" class="formula" type="text" value="pow(m, -2.35)" spellcheck="false" />
+            <div class="mass-bounds">
+              <label>Masse min.
+                <input id="massMin" type="number" min="0.0001" step="0.05" value="0.2" />
+              </label>
+              <label>Masse max.
+                <input id="massMax" type="number" min="0.0002" step="0.1" value="5" />
+              </label>
+            </div>
+            <p class="formula-help">Variable <code>m</code> · fonctions : exp, log, pow, sqrt, abs</p>
+            <output id="densityStatus" class="density-status">Loi de Salpeter · prête</output>
+          </details>
+          <details class="mass-editor" open>
+            <summary>Expansion de l’univers</summary>
+            <label class="field-label" for="expansion">Facteur d’échelle a(t)</label>
+            <input id="expansion" class="formula" type="text" value="1" spellcheck="false" />
+            <p class="formula-help">Valeurs positives, nulles ou négatives · <code>a(t)=0</code> est régularisé · exemples : <code>-1</code>, <code>1 - 0.02*t</code></p>
+            <output id="expansionStatus" class="density-status">Univers statique · a(0) = 1</output>
+          </details>
+          <details class="mass-editor" open>
+            <summary>Théorie de la gravité</summary>
+            <div>
+              <div class="control-head"><label for="gravity">Constante G</label><output id="gravityValue">0.48</output></div>
+              <input id="gravity" type="range" min="-2" max="2" step="0.01" value="0.48" />
+            </div>
+            <div>
+              <div class="control-head"><label for="gravityPower">Exposant β</label><output id="gravityPowerValue">1 / r²</output></div>
+              <input id="gravityPower" type="range" min="0.5" max="3.5" step="0.05" value="2" />
+            </div>
+            <div>
+              <div class="control-head"><label for="softening">Adoucissement ε</label><output id="softeningValue">0.042</output></div>
+              <input id="softening" type="range" min="0.005" max="0.15" step="0.001" value="0.042" />
+            </div>
+            <p class="formula-help"><code>|F| ∝ G / r^β</code> · G négatif crée une gravité répulsive</p>
+            <output id="gravityStatus" class="density-status">Newton modifié · paramètres appliqués en direct</output>
+          </details>
+          <div class="toggle-row">
+            <label for="tree">Afficher le quadtree</label>
+            <label class="switch" for="tree"><input id="tree" type="checkbox" /><span aria-hidden="true"></span></label>
+          </div>
+        </div>
+
+        <p class="intro"><a href="comparison.html" style="color:var(--acid)">Ouvrir Galaxy Workspace →</a><br>Galaxie continue · étoiles · systèmes stellaires</p>
+<div class="actions">
+          <button id="reset" class="action" type="button">Ré-échantillonner</button>
+          <button id="pause" class="action primary" type="button">Pause</button>
+        </div>
+      </aside>
+    </section>
+
+    <section class="method" aria-label="Étapes de la méthode">
+      <article><b>01 / P2M</b><strong>Partition</strong><p>Les particules rejoignent les feuilles d’un quadtree équilibré.</p></article>
+      <article><b>02 / M2M</b><strong>Agrégation</strong><p>Masses et centres sont remontés jusqu’à la racine.</p></article>
+      <article><b>03 / M2L</b><strong>Traduction</strong><p>Chaque liste lointaine devient un champ local compact.</p></article>
+      <article><b>04 / L2P</b><strong>Évaluation</strong><p>Champ local et voisinage direct déplacent chaque corps.</p></article>
+    </section>
+  </main>
+  <script src="fmm-gpu-compute.js?v=13"></script>
+  <script src="fmm-core.js?v=1"></script>
+  <script src="fmm.js?v=14"></script>
+</body>
+</html>

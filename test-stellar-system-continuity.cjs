@@ -1,0 +1,10 @@
+const assert=require('node:assert/strict'),L=require('./stellar-light'),S=require('./planetary-systems');
+const scale=10000/S.AU_PC,projection={width:.00002,pixel:.00002/8,left:-.00001,bottom:-.00001,centerX:0,centerY:0,resolution:8,image:new Float64Array(64).fill(1e-11),mass:64e-11,expected:64},star={id:'neighbor',x:.000004,y:-.000003,photometry:{radius:1,luminosity:1,visibleLuminosity:.4,color:[1,.7,.3]}};
+const options={population:100000000000n,gain:.01,lengthPc:10000,exposureEV:-4};
+const original=L.lightPlan(projection,[star],options),local={...projection,width:projection.width*scale,pixel:projection.pixel*scale,left:projection.left*scale,bottom:projection.bottom*scale};
+const converted={...star,x:star.x*scale,y:star.y*scale},rebased=L.lightPlan(local,[converted],{...options,lengthPc:S.AU_PC,normalizationLengthPc:10000});
+for(const key of ['linearFlux','peak','distancePc','radiusPixels','visibleFluxWm2'])assert(Math.abs(original.candidates[0][key]/rebased.candidates[0][key]-1)<1e-12,key+' must not jump between scenes');
+const body={...star,id:'planet',photometry:{...star.photometry,isSystemBody:true}};
+const mixed=L.lightPlan(projection,[star,body],options);assert.deepEqual(mixed.diffuseImage,original.diffuseImage,'planets do not count as resolved galactic stars');
+const faded=L.lightPlan(projection,[star,body],{...options,detailWeight:.25});assert.equal(faded.candidates[1].linearFlux,mixed.candidates[1].linearFlux,'planet light is independent of galactic source LOD');
+console.log('Passed: invariant stellar distance/flux/size across model-to-AU conversion, shared radiometry and separate collective statistics.');

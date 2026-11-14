@@ -1,0 +1,16 @@
+const assert=require('node:assert/strict'),{stellarDetailLevel,readLightCalibration,SimulationClock}=require('./observation-tools'),{lightPlan,sourceOptics,cameraGeometry}=require('./stellar-light');
+const budget=512,N=100000000000n;
+for(const count of [1e11,1e8,1e6,100000,16384])assert.equal(stellarDetailLevel(count,budget),0,'crowded fields must not discover individual stars');
+assert.equal(stellarDetailLevel(1024,budget,2),0);assert(stellarDetailLevel(1024,budget,32)>stellarDetailLevel(1024,budget,8));assert.equal(stellarDetailLevel(256,budget),1);assert.equal(stellarDetailLevel(2048,budget),.5);
+let previous=0;for(let count=16384;count>=128;count-=1){const level=stellarDetailLevel(count,budget);assert(level>=previous&&level<=1);previous=level;}
+assert.equal(stellarDetailLevel(4096,128),0);assert(stellarDetailLevel(400,512)>0,'larger capacity permits a denser camera field');
+const projection={width:1,pixel:1/8,left:-.5,bottom:-.5,centerX:0,centerY:0,resolution:8,mass:512/Number(N),expected:512,image:new Float64Array(64).fill(512/Number(N)/64)},star={id:'test',x:0,y:0,photometry:{radius:1,luminosity:100,visibleLuminosity:50,color:[1,1,1]}};
+const diffuse=lightPlan(projection,[],{population:N,detailWeight:0});assert(Math.abs(diffuse.residual-1)<1e-12,'delayed source discovery must not leave a dark hole');
+const full=lightPlan(projection,[star],{population:N,detailWeight:1}),half=lightPlan(projection,[star],{population:N,detailWeight:.5});assert.equal(half.candidates[0].fluxWm2,full.candidates[0].fluxWm2,'LOD must not change physical flux or stellar properties');assert.equal(half.candidates[0].linearFlux,full.candidates[0].linearFlux*.5);assert(half.residual>full.residual,'light not yet resolved remains in the ensemble field');
+const near=sourceOptics(star,cameraGeometry(projection)),far=sourceOptics(star,cameraGeometry({...projection,width:2}));assert(Math.abs(near.fluxWm2/far.fluxWm2-4)<1e-10);
+const clock=new SimulationClock();clock.setRate('1','My');clock.tick(80);assert.equal(clock.duration(),.025);assert.equal(clock.duration(.1),.08,'GPU may integrate its full backlog using stable solver substeps');clock.consume(.08);assert.equal(clock.duration(.1),0);assert.equal(clock.format(),'0.08 My');
+console.log('Passed: density-budget source onset, smooth population transition, retained diffuse light, physical flux unaffected and GPU duration without time skipping.');
+
+assert.deepEqual(readLightCalibration('5003','47.125'),{budget:5003,onset:47.125});assert.deepEqual(readLightCalibration('1e4','0,125'),{budget:10000,onset:.125});assert.equal(stellarDetailLevel(64,512,.125),0);assert.equal(stellarDetailLevel(32,512,.125),1);assert.equal(stellarDetailLevel(1,0,32),0);assert(Number.isFinite(stellarDetailLevel(1e11,512,1e300)));
+for(const [budget,onset]of [['','32'],['12.5','32'],['-1','32'],['512','0'],['512',''],['512','Infinity']])assert.throws(()=>readLightCalibration(budget,onset));assert.throws(()=>readLightCalibration('5003','32',4096),/4096|4.096/);assert.deepEqual(readLightCalibration(0,32),{budget:0,onset:32});
+console.log('Passed: arbitrary integer ceilings, positive fractional/scientific onset, zero sources, hardware limits and invalid-value rejection.');

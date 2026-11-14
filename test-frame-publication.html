@@ -1,0 +1,23 @@
+<!doctype html><meta charset="utf-8"><title>Committed physical frames</title><iframe id="app" src="comparison.html" width="1500" height="1000"></iframe><pre id="output">RUNNING</pre><script>
+const sleep=ms=>new Promise(r=>setTimeout(r,ms)),wait=async f=>{for(let i=0;i<500;i++){if(f())return;await sleep(40);}throw Error('Timed out');};
+(async()=>{try{
+ await wait(()=>app.contentDocument?.getElementById('continuous')?.getAttribute('data-render-backend')==='GPU');
+ const w=app.contentWindow,d=app.contentDocument,$=id=>d.getElementById(id),canvas=$('continuous');
+ $('followStar').click();const host=$('materialId').value;$('visitSystem').click();await wait(()=>canvas.getAttribute('data-system-host')===host&&!JSON.parse(canvas.getAttribute('data-zoom-animating')));
+ const planet=w.PlanetarySystems.describe(host).seeds[0].id;$('materialId').value=planet;$('findMaterial').click();await wait(()=>canvas.getAttribute('data-system-tracked')===planet);
+ const fullAU=Number($('cameraHeight').value)*2*Math.tan(Number($('cameraFov').value)*Math.PI/360)*Number($('zoomValue').value);
+ $('zoomValue').value=String(fullAU/20);$('zoomValue').dispatchEvent(new Event('change'));await wait(()=>canvas.getAttribute('data-zoom-animating')==='false');
+ const render=w.GPUStellarLightRenderer.prototype.render,presentation=w.cameraPresentation,advance=w.PlanetarySystems.Manager.prototype.advance;
+ let latest=null,frame=null,advances=0,pending=false,checked=0,pendingFrames=0,trackedChecks=0,freeChecks=0,failures=[];
+ w.GPUStellarLightRenderer.prototype.render=function(c,p,points,options){latest={p:{...p},body:points.find(q=>q.id===planet)};return render.call(this,c,p,points,options);};
+ w.PlanetarySystems.Manager.prototype.advance=async function(...args){advances++;pending=true;await sleep(45);const result=await advance.apply(this,args);await sleep(45);pending=false;return result;};
+ w.cameraPresentation=function(image,view,size){const t=presentation(image,view,size);if(image.space==='system'&&view.space==='system'&&latest?.body){frame={image,view,size,t,...latest};checked++;if(pending)pendingFrames++;if(view.follow?.id===planet){trackedChecks++;const x=(latest.body.x-image.x)/image.width*t.scale+t.x/size,y=(latest.body.y-image.y)/image.width*t.scale-t.y/size;if(Math.abs(x)>1e-8||Math.abs(y)>1e-8)failures.push({kind:'tracked image',x,y});}else if(!view.follow){freeChecks++;if(Math.abs(t.x)>1e-7||Math.abs(t.y)>1e-7)failures.push({kind:'free image',t});}}return t;};
+ const checkOverlay=()=>{if(!frame)return;const ring=$('systemOverlay').querySelector('[data-body-id="'+planet+'"]');if(!ring)return;const {image,body,t,size}=frame,x=Number($('systemOverlay').getAttribute('viewBox').split(' ')[2])/2+(body.x-image.x)/image.width*Math.max(...$('systemOverlay').getAttribute('viewBox').split(' ').slice(2).map(Number))*t.scale+t.x/size*Math.max(...$('systemOverlay').getAttribute('viewBox').split(' ').slice(2).map(Number)),y=Number($('systemOverlay').getAttribute('viewBox').split(' ')[3])/2-(body.y-image.y)/image.width*Math.max(...$('systemOverlay').getAttribute('viewBox').split(' ').slice(2).map(Number))*t.scale+t.y/size*Math.max(...$('systemOverlay').getAttribute('viewBox').split(' ').slice(2).map(Number));if(Math.abs(Number(ring.getAttribute('cx'))-x)>1e-7||Math.abs(Number(ring.getAttribute('cy'))-y)>1e-7)failures.push({kind:'overlay',x,y,actualX:ring.getAttribute('cx'),actualY:ring.getAttribute('cy')});};
+ $('speedUnit').value='y';$('speedValue').value='.1';$('applySpeed').click();$('pause').click();
+ for(let i=0;i<90;i++){await new Promise(r=>w.requestAnimationFrame(r));checkOverlay();}
+ $('stopTracking').click();await sleep(150);failures=failures.filter(f=>f.kind!=='free image');
+ for(let i=0;i<90;i++){await new Promise(r=>w.requestAnimationFrame(r));checkOverlay();}
+ $('pause').click();if(failures.length)throw Error(JSON.stringify(failures.slice(0,4)));if(advances<3||pendingFrames<10||trackedChecks<10||freeChecks<10)throw Error('Insufficient physics/frame coverage '+JSON.stringify({advances,pendingFrames,trackedChecks,freeChecks}));
+ output.textContent='PASS '+JSON.stringify({advances,checked,pendingFrames,trackedChecks,freeChecks,alignedBodyAndGuides:true,delayedGPUPublication:true});
+}catch(e){output.textContent='FAIL '+e.stack+' '+app.contentDocument?.getElementById('backendStatus')?.textContent;}await fetch('/result',{method:'POST',body:output.textContent});})();
+</script>

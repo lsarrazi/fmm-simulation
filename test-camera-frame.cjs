@@ -1,0 +1,12 @@
+const assert=require('node:assert/strict'),{cameraPresentation}=require('./observation-tools'),AU=1/206264.80624709636;
+const base={originX:.83,originY:-.17,modelLengthPc:10000,follow:{id:'host',x:0,y:0}};
+const galaxy={...base,x:2000*AU/10000,y:-1000*AU/10000,unitPc:10000,width:12000*AU/10000};
+const system={...base,x:2000,y:-1000,unitPc:AU,width:12000};
+for(const [image,view] of [[galaxy,system],[system,galaxy]])assert.deepEqual(cameraPresentation(image,view,600),{scale:1,x:0,y:-0},'changing coordinate frame alone must not move the image');
+const moved={...system,originX:base.originX+.001,originY:base.originY+.002};
+assert.deepEqual(cameraPresentation(galaxy,moved,600),{scale:1,x:0,y:-0},'same tracked source cancels origin movement');
+const panned={...system,x:3000,y:1000,width:6000};
+const t=cameraPresentation(galaxy,panned,600);assert(Math.abs(t.scale-2)<1e-14);assert(Math.abs(t.x+100)<1e-12);assert(Math.abs(t.y-200)<1e-12);
+const free={...system,follow:null,originX:base.originX+.001};
+assert(Math.abs(cameraPresentation(galaxy,free,600).x+10/(12000*AU)*600)<1e-8,'free camera preserves physical translation');
+console.log('Passed: immutable camera frames, model/AU transitions, moving reference, pan/zoom and free camera.');
